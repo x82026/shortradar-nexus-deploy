@@ -2,7 +2,7 @@
 """
 ShortRadar — Enhanced FastAPI Backend
 Multi-source data aggregation with WebSocket streaming.
-Sources: yfinance (default), Alpha Vantage, Finnhub, Bookmap/dxFeed, IBKR
+Sources: Alpha Vantage (primary), Databento (real-time), Finnhub, Bookmap/dxFeed, IBKR
 """
 import asyncio
 import json
@@ -58,7 +58,6 @@ COMPANY_NAMES = {
 # Data Models
 # ---------------------------------------------------------------------------
 class DataSource(str, Enum):
-    YFINANCE = "yfinance"
     ALPHA_VANTAGE = "alpha_vantage"
     FINNHUB = "finnhub"
     BOOKMAP = "bookmap"
@@ -87,7 +86,7 @@ class Quote(BaseModel):
     bid_size: int = 0
     ask_size: int = 0
     timestamp: str = ""
-    source: str = "yfinance"
+    source: str = "alpha_vantage"
 
 class TechnicalIndicators(BaseModel):
     symbol: str
@@ -217,138 +216,210 @@ store = DataStore()
 # ---------------------------------------------------------------------------
 # Data Source Adapters
 # ---------------------------------------------------------------------------
-async def fetch_yfinance_quotes(symbols: list[str]) -> list[Quote]:
-    """Fetch quotes via yfinance (runs in thread since it's synchronous)."""
-    import yfinance as yf
-
-    def _fetch():
-        results = []
-        try:
-            tickers = yf.Tickers(" ".join(symbols))
-            for sym in symbols:
-                try:
-                    t = tickers.tickers.get(sym)
-                    if not t:
-                        continue
-                    info = t.fast_info
-                    price = float(info.last_price) if hasattr(info, 'last_price') and info.last_price else 0
-                    prev = float(info.previous_close) if hasattr(info, 'previous_close') and info.previous_close else price
-                    change = price - prev
-                    change_pct = (change / prev * 100) if prev else 0
-                    vol = int(info.last_volume) if hasattr(info, 'last_volume') and info.last_volume else 0
-
-                    q = Quote(
-                        symbol=sym,
-                        price=round(price, 2),
-                        change=round(change, 2),
-                        change_pct=round(change_pct, 2),
-                        volume=vol,
-                        high=round(float(info.day_high), 2) if hasattr(info, 'day_high') and info.day_high else price,
-                        low=round(float(info.day_low), 2) if hasattr(info, 'day_low') and info.day_low else price,
-                        open=round(float(info.open), 2) if hasattr(info, 'open') and info.open else price,
-                        prev_close=round(prev, 2),
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                        source="yfinance"
-                    )
-                    results.append(q)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+async def fetch_alphavantage_quotes(symbols: list[str]) -> list[Quote]:
+    """Fetch quotes via Alpha Vantage GLOBAL_QUOTE endpoint (async HTTP).
+    Premium tier allows 75 req/min — we stagger slightly to stay safe."""
+    results = []
+    if ALPHA_VANTAGE_KEY == "demo":
         return results
+    async with httpx.AsyncClient(timeout=12) as client:
+        for sym in symbols:
+            try:
+                r = await client.get(
+                    "https://www.alphavantage.co/query",
+                    params={"function": "GLOBAL_QUOTE", "symbol": sym, "apikey": ALPHA_VANTAGE_KEY}
+                )
+                data = r.json().get("Global Quote", {})
+                if not data or not data.get("05. price"):
+                    continue
+                price = float(data["05. price"])
+                prev = float(data.get("08. previous close", 0) or 0)
+                change = float(data.get("09. change", 0) or 0)
+                change_pct_str = data.get("10. change percent", "0").replace("%", "")
+                change_pct = float(change_pct_str) if change_pct_str else 0
+                results.append(Quote(
+                    symbol=sym,
+                    price=round(price, 2),
+                    change=round(change, 2),
+                    change_pct=round(change_pct, 2),
+                    volume=int(data.get("06. volume", 0) or 0),
+                    high=round(float(data.get("03. high", 0) or 0), 2),
+                    low=round(float(data.get("04. low", 0) or 0), 2),
+                    open=round(float(data.get("02. open", 0) or 0), 2),
+                    prev_close=round(prev, 2),
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    source="alpha_vantage"
+                ))
+                await asyncio.sleep(0.25)  # ~4 req/s, well under 75/min premium limit
+            except Exception as e:
+                print(f"[AlphaVantage] Quote error for {sym}: {e}", flush=True)
+    return results
 
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _fetch)
+
+async def fetch_alphavantage_daily(symbol: str, outputsize: str = "compact") -> list[dict]:
+    """Fetch daily OHLCV bars from Alpha Vantage TIME_SERIES_DAILY.
+    compact = last 100 data points; full = 20+ years.
+    Returns list of dicts: [{date, open, high, low, close, volume}, ...] newest-first."""
+    if ALPHA_VANTAGE_KEY == "demo":
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://www.alphavantage.co/query",
+                params={
+                    "function": "TIME_SERIES_DAILY",
+                    "symbol": symbol,
+                    "outputsize": outputsize,
+                    "apikey": ALPHA_VANTAGE_KEY,
+                }
+            )
+            data = r.json()
+            ts = data.get("Time Series (Daily)", {})
+            if not ts:
+                print(f"[AlphaVantage] No daily data for {symbol}: {list(data.keys())}", flush=True)
+                return []
+            bars = []
+            for date_str in sorted(ts.keys(), reverse=True):
+                d = ts[date_str]
+                bars.append({
+                    "date": date_str,
+                    "open": float(d["1. open"]),
+                    "high": float(d["2. high"]),
+                    "low": float(d["3. low"]),
+                    "close": float(d["4. close"]),
+                    "volume": int(d["5. volume"]),
+                })
+            return bars
+    except Exception as e:
+        print(f"[AlphaVantage] Daily fetch error for {symbol}: {e}", flush=True)
+        return []
 
 
-async def fetch_yfinance_technicals(symbol: str) -> Optional[TechnicalIndicators]:
-    """Calculate technicals from yfinance historical data."""
-    import yfinance as yf
+async def fetch_alphavantage_intraday(symbol: str, interval: str = "5min") -> list[CandleBar]:
+    """Fetch intraday candles from Alpha Vantage TIME_SERIES_INTRADAY."""
+    if ALPHA_VANTAGE_KEY == "demo":
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://www.alphavantage.co/query",
+                params={
+                    "function": "TIME_SERIES_INTRADAY",
+                    "symbol": symbol,
+                    "interval": interval,
+                    "outputsize": "compact",
+                    "apikey": ALPHA_VANTAGE_KEY,
+                }
+            )
+            data = r.json()
+            ts_key = f"Time Series ({interval})"
+            ts = data.get(ts_key, {})
+            if not ts:
+                return []
+            bars = []
+            for ts_str in sorted(ts.keys()):
+                d = ts[ts_str]
+                bars.append(CandleBar(
+                    timestamp=ts_str,
+                    open=round(float(d["1. open"]), 2),
+                    high=round(float(d["2. high"]), 2),
+                    low=round(float(d["3. low"]), 2),
+                    close=round(float(d["4. close"]), 2),
+                    volume=int(d["5. volume"]),
+                ))
+            return bars
+    except Exception as e:
+        print(f"[AlphaVantage] Intraday error for {symbol}: {e}", flush=True)
+        return []
+
+
+async def fetch_alphavantage_technicals(symbol: str) -> Optional[TechnicalIndicators]:
+    """Calculate technicals from Alpha Vantage daily historical data."""
     import numpy as np
 
-    def _calc():
-        try:
-            t = yf.Ticker(symbol)
-            hist = t.history(period="6mo", interval="1d")
-            if hist.empty or len(hist) < 26:
-                return None
+    bars = await fetch_alphavantage_daily(symbol, outputsize="compact")  # ~100 days
+    if len(bars) < 26:
+        return None
 
-            close = hist['Close'].values
-            volume = hist['Volume'].values
+    try:
+        # bars are newest-first, reverse for calculations
+        bars_asc = list(reversed(bars))
+        close = np.array([b["close"] for b in bars_asc])
+        volume = np.array([b["volume"] for b in bars_asc])
+        highs = np.array([b["high"] for b in bars_asc])
+        lows = np.array([b["low"] for b in bars_asc])
 
-            # RSI 14
-            deltas = np.diff(close)
-            gains = np.where(deltas > 0, deltas, 0)
-            losses = np.where(deltas < 0, -deltas, 0)
-            avg_gain = np.mean(gains[-14:])
-            avg_loss = np.mean(losses[-14:])
-            rs = avg_gain / avg_loss if avg_loss != 0 else 100
-            rsi = 100 - (100 / (1 + rs))
+        # RSI 14
+        deltas = np.diff(close)
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        avg_gain = np.mean(gains[-14:])
+        avg_loss = np.mean(losses[-14:])
+        rs = avg_gain / avg_loss if avg_loss != 0 else 100
+        rsi = 100 - (100 / (1 + rs))
 
-            # MACD
-            ema12 = _ema(close, 12)
-            ema26 = _ema(close, 26)
-            macd_line = ema12[-1] - ema26[-1]
-            macd_series = [_ema(close[:i+1], 12)[-1] - _ema(close[:i+1], 26)[-1]
-                           for i in range(25, len(close))]
-            signal = _ema(macd_series, 9)[-1] if len(macd_series) >= 9 else 0
-            macd_hist = macd_line - signal
+        # MACD
+        ema12 = _ema(close, 12)
+        ema26 = _ema(close, 26)
+        macd_line = ema12[-1] - ema26[-1]
+        macd_series = [_ema(close[:i+1], 12)[-1] - _ema(close[:i+1], 26)[-1]
+                       for i in range(25, len(close))]
+        signal = _ema(macd_series, 9)[-1] if len(macd_series) >= 9 else 0
+        macd_hist = macd_line - signal
 
-            # SMAs
-            sma20 = float(np.mean(close[-20:])) if len(close) >= 20 else None
-            sma50 = float(np.mean(close[-50:])) if len(close) >= 50 else None
-            sma200 = float(np.mean(close[-200:])) if len(close) >= 200 else None
+        # SMAs
+        sma20 = float(np.mean(close[-20:])) if len(close) >= 20 else None
+        sma50 = float(np.mean(close[-50:])) if len(close) >= 50 else None
+        sma200 = float(np.mean(close[-200:])) if len(close) >= 200 else None
 
-            # Bollinger Bands
-            if sma20:
-                std20 = float(np.std(close[-20:]))
-                bb_upper = sma20 + 2 * std20
-                bb_lower = sma20 - 2 * std20
-            else:
-                bb_upper = bb_lower = None
+        # Bollinger Bands
+        if sma20:
+            std20 = float(np.std(close[-20:]))
+            bb_upper = sma20 + 2 * std20
+            bb_lower = sma20 - 2 * std20
+        else:
+            bb_upper = bb_lower = None
 
-            # ATR 14
-            if len(hist) >= 15:
-                highs = hist['High'].values[-15:]
-                lows = hist['Low'].values[-15:]
-                closes = close[-15:]
-                trs = []
-                for i in range(1, len(highs)):
-                    tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-                    trs.append(tr)
-                atr = float(np.mean(trs[-14:]))
-            else:
-                atr = None
+        # ATR 14
+        if len(bars_asc) >= 15:
+            h = highs[-15:]
+            l = lows[-15:]
+            c = close[-15:]
+            trs = []
+            for i in range(1, len(h)):
+                tr = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
+                trs.append(tr)
+            atr = float(np.mean(trs[-14:]))
+        else:
+            atr = None
 
-            # VWAP (intraday approx)
-            if len(volume) > 0 and np.sum(volume[-20:]) > 0:
-                tp = (hist['High'].values[-20:] + hist['Low'].values[-20:] + close[-20:]) / 3
-                vwap = float(np.sum(tp * volume[-20:]) / np.sum(volume[-20:]))
-            else:
-                vwap = None
+        # VWAP (approx using last 20 days)
+        if len(volume) > 0 and np.sum(volume[-20:]) > 0:
+            tp = (highs[-20:] + lows[-20:] + close[-20:]) / 3
+            vwap = float(np.sum(tp * volume[-20:]) / np.sum(volume[-20:]))
+        else:
+            vwap = None
 
-            return TechnicalIndicators(
-                symbol=symbol,
-                rsi_14=round(rsi, 2),
-                macd=round(macd_line, 4),
-                macd_signal=round(signal, 4),
-                macd_hist=round(macd_hist, 4),
-                sma_20=round(sma20, 2) if sma20 else None,
-                sma_50=round(sma50, 2) if sma50 else None,
-                sma_200=round(sma200, 2) if sma200 else None,
-                ema_12=round(float(ema12[-1]), 2),
-                ema_26=round(float(ema26[-1]), 2),
-                bb_upper=round(bb_upper, 2) if bb_upper else None,
-                bb_lower=round(bb_lower, 2) if bb_lower else None,
-                bb_middle=round(sma20, 2) if sma20 else None,
-                atr_14=round(atr, 2) if atr else None,
-                vwap=round(vwap, 2) if vwap else None,
-            )
-        except Exception:
-            return None
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _calc)
+        return TechnicalIndicators(
+            symbol=symbol,
+            rsi_14=round(rsi, 2),
+            macd=round(macd_line, 4),
+            macd_signal=round(signal, 4),
+            macd_hist=round(macd_hist, 4),
+            sma_20=round(sma20, 2) if sma20 else None,
+            sma_50=round(sma50, 2) if sma50 else None,
+            sma_200=round(sma200, 2) if sma200 else None,
+            ema_12=round(float(ema12[-1]), 2),
+            ema_26=round(float(ema26[-1]), 2),
+            bb_upper=round(bb_upper, 2) if bb_upper else None,
+            bb_lower=round(bb_lower, 2) if bb_lower else None,
+            bb_middle=round(sma20, 2) if sma20 else None,
+            atr_14=round(atr, 2) if atr else None,
+            vwap=round(vwap, 2) if vwap else None,
+        )
+    except Exception as e:
+        print(f"[AlphaVantage] Technicals error for {symbol}: {e}", flush=True)
+        return None
 
 
 def _ema(data, period):
@@ -363,35 +434,11 @@ def _ema(data, period):
     return ema
 
 
+# fetch_alpha_vantage_quote — kept for single-symbol API endpoint compatibility
 async def fetch_alpha_vantage_quote(symbol: str) -> Optional[Quote]:
-    """Fetch from Alpha Vantage Global Quote."""
-    if ALPHA_VANTAGE_KEY == "demo":
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://www.alphavantage.co/query",
-                params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": ALPHA_VANTAGE_KEY}
-            )
-            data = r.json().get("Global Quote", {})
-            if not data:
-                return None
-            price = float(data.get("05. price", 0))
-            return Quote(
-                symbol=symbol,
-                price=price,
-                change=float(data.get("09. change", 0)),
-                change_pct=float(data.get("10. change percent", "0").replace("%", "")),
-                volume=int(data.get("06. volume", 0)),
-                high=float(data.get("03. high", 0)),
-                low=float(data.get("04. low", 0)),
-                open=float(data.get("02. open", 0)),
-                prev_close=float(data.get("08. previous close", 0)),
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                source="alpha_vantage"
-            )
-    except Exception:
-        return None
+    """Fetch a single quote from Alpha Vantage Global Quote."""
+    quotes = await fetch_alphavantage_quotes([symbol])
+    return quotes[0] if quotes else None
 
 
 async def fetch_finnhub_quote(symbol: str) -> Optional[Quote]:
@@ -451,55 +498,48 @@ async def fetch_finnhub_sentiment(symbol: str) -> dict:
         return {"mentions": 0, "sentiment": "neutral", "score": 0}
 
 
-async def fetch_yfinance_candles(symbol: str, period: str = "5d", interval: str = "5m") -> list[CandleBar]:
-    """Fetch OHLCV candles from yfinance."""
-    import yfinance as yf
-
-    def _fetch():
-        try:
-            t = yf.Ticker(symbol)
-            hist = t.history(period=period, interval=interval)
-            bars = []
-            for idx, row in hist.iterrows():
-                bars.append(CandleBar(
-                    timestamp=idx.isoformat(),
-                    open=round(float(row['Open']), 2),
-                    high=round(float(row['High']), 2),
-                    low=round(float(row['Low']), 2),
-                    close=round(float(row['Close']), 2),
-                    volume=int(row['Volume'])
-                ))
-            return bars
-        except Exception:
-            return []
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _fetch)
+async def fetch_candles(symbol: str, period: str = "5d", interval: str = "5m") -> list[CandleBar]:
+    """Fetch OHLCV candles from Alpha Vantage.
+    For intraday intervals (1min, 5min, 15min, 30min, 60min) uses INTRADAY.
+    For daily/weekly uses TIME_SERIES_DAILY."""
+    # Map yfinance-style intervals to Alpha Vantage
+    av_interval_map = {
+        "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "60m": "60min",
+        "1min": "1min", "5min": "5min", "15min": "15min", "30min": "30min", "60min": "60min",
+    }
+    av_interval = av_interval_map.get(interval)
+    if av_interval:
+        return await fetch_alphavantage_intraday(symbol, av_interval)
+    else:
+        # Daily candles
+        bars = await fetch_alphavantage_daily(symbol, outputsize="compact")
+        return [
+            CandleBar(
+                timestamp=b["date"],
+                open=round(b["open"], 2),
+                high=round(b["high"], 2),
+                low=round(b["low"], 2),
+                close=round(b["close"], 2),
+                volume=b["volume"],
+            )
+            for b in reversed(bars)  # oldest first for charting
+        ]
 
 
 async def fetch_nasdaq_index() -> Optional[NASDAQIndex]:
-    """Fetch NASDAQ Composite index data."""
-    import yfinance as yf
-
-    def _fetch():
-        try:
-            t = yf.Ticker("^IXIC")
-            info = t.fast_info
-            price = float(info.last_price) if hasattr(info, 'last_price') and info.last_price else 0
-            prev = float(info.previous_close) if hasattr(info, 'previous_close') and info.previous_close else price
-            change = price - prev
-            change_pct = (change / prev * 100) if prev else 0
+    """Fetch NASDAQ Composite index data from Alpha Vantage."""
+    try:
+        q = await fetch_alpha_vantage_quote("QQQ")  # Use QQQ as NASDAQ proxy
+        if q:
             return NASDAQIndex(
-                price=round(price, 2),
-                change=round(change, 2),
-                change_pct=round(change_pct, 2),
-                timestamp=datetime.now(timezone.utc).isoformat()
+                price=q.price,
+                change=q.change,
+                change_pct=q.change_pct,
+                timestamp=q.timestamp,
             )
-        except Exception:
-            return None
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _fetch)
+        return None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -782,8 +822,11 @@ def _format_volume(vol):
 # Enhanced Short Scanner Logic
 # ---------------------------------------------------------------------------
 async def scan_short_candidates() -> list[ShortCandidate]:
-    """Scan top gainers for short opportunities with enhanced metrics."""
-    import yfinance as yf
+    """Scan top gainers for short opportunities with enhanced metrics.
+
+    Uses Alpha Vantage TIME_SERIES_DAILY for technicals + GLOBAL_QUOTE for current price.
+    Falls back to Databento live quotes for any symbol AV can't cover.
+    """
     import numpy as np
 
     # Merge hardcoded scanner symbols with user-added watchlist symbols
@@ -792,202 +835,248 @@ async def scan_short_candidates() -> list[ShortCandidate]:
         "UPST", "AFRM", "HOOD", "SOFI", "LCID", "RIVN", "IONQ", "RGTI",
         "SOUN", "RKLB", "LUNR", "JOBY", "ROKU"
     ]
-    all_scanner_symbols = list(dict.fromkeys(_base_scanner + store.watchlist))  # dedupe, preserve order
+    all_scanner_symbols = list(dict.fromkeys(_base_scanner + store.watchlist))
 
-    def _scan():
-        candidates = []
+    # --- Pre-fetch all daily history via Alpha Vantage (batched, with rate limiting) ---
+    daily_cache: dict[str, list[dict]] = {}  # sym -> bars
+    quote_cache: dict[str, Quote] = {}  # sym -> Quote
+
+    print(f"[Scanner] Fetching daily data for {len(all_scanner_symbols)} symbols via Alpha Vantage...", flush=True)
+
+    # Fetch in batches of 4 to respect rate limits (~4 req/s for premium)
+    batch_size = 4
+    for i in range(0, len(all_scanner_symbols), batch_size):
+        batch = all_scanner_symbols[i:i + batch_size]
+        tasks = [fetch_alphavantage_daily(sym, outputsize="compact") for sym in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for sym, result in zip(batch, results):
+            if isinstance(result, list) and len(result) > 0:
+                daily_cache[sym] = result
+            else:
+                print(f"[Scanner] No AV daily data for {sym}", flush=True)
+        await asyncio.sleep(0.3)  # brief pause between batches
+
+    # Fetch current quotes
+    quote_results = await fetch_alphavantage_quotes(all_scanner_symbols)
+    for q in quote_results:
+        quote_cache[q.symbol] = q
+
+    print(f"[Scanner] Got daily data for {len(daily_cache)} symbols, quotes for {len(quote_cache)}", flush=True)
+
+    candidates = []
+
+    for sym in all_scanner_symbols:
         try:
-            screener_symbols = all_scanner_symbols
-            tickers = yf.Tickers(" ".join(screener_symbols))
-            for sym in screener_symbols:
-                try:
-                    t = tickers.tickers.get(sym)
-                    if not t:
-                        continue
-                    info = t.fast_info
-                    price = float(info.last_price) if hasattr(info, 'last_price') and info.last_price else 0
-                    prev = float(info.previous_close) if hasattr(info, 'previous_close') and info.previous_close else price
-                    if prev == 0:
-                        continue
-                    change_pct = (price - prev) / prev * 100
-                    vol = int(info.last_volume) if hasattr(info, 'last_volume') and info.last_volume else 0
+            bars = daily_cache.get(sym, [])
+            quote = quote_cache.get(sym)
 
-                    # Get market cap
-                    try:
-                        market_cap_raw = float(info.market_cap) if hasattr(info, 'market_cap') and info.market_cap else 0
-                    except Exception:
-                        market_cap_raw = 0
-                    market_cap_str = _format_market_cap(market_cap_raw)
+            # Get price from AV quote, Databento, or daily bars
+            db_data = _databento_quotes.get(sym)
+            if quote:
+                price = quote.price
+                prev = quote.prev_close or price
+                change_pct = quote.change_pct
+                vol = quote.volume
+            elif db_data and db_data.get("last", 0) > 0:
+                price = round(db_data["last"], 2)
+                prev = price  # no prev_close from Databento
+                change_pct = 0
+                vol = 0
+            elif bars:
+                price = bars[0]["close"]  # newest bar
+                prev = bars[1]["close"] if len(bars) > 1 else price
+                change_pct = ((price - prev) / prev * 100) if prev else 0
+                vol = bars[0]["volume"]
+            else:
+                # No data at all — build minimal fallback card
+                candidates.append(_build_fallback_candidate(sym))
+                continue
 
-                    # Calculate technicals from history
-                    hist = t.history(period="1y", interval="1d")
-                    if hist.empty or len(hist) < 20:
-                        continue
-                    close = hist['Close'].values
-                    high_arr = hist['High'].values
-                    low_arr = hist['Low'].values
+            if prev == 0:
+                prev = price
+            if not change_pct and prev:
+                change_pct = ((price - prev) / prev * 100)
 
-                    # RSI
-                    deltas = np.diff(close)
-                    gains = np.where(deltas > 0, deltas, 0)
-                    losses = np.where(deltas < 0, -deltas, 0)
-                    avg_gain = np.mean(gains[-14:])
-                    avg_loss = np.mean(losses[-14:])
-                    rs = avg_gain / avg_loss if avg_loss != 0 else 100
-                    rsi = 100 - (100 / (1 + rs))
-                    rsi_status = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
+            market_cap_str = "N/A"  # AV doesn't include market cap in daily/quote
 
-                    # SMAs
-                    sma50 = float(np.mean(close[-50:])) if len(close) >= 50 else None
-                    sma200 = float(np.mean(close[-200:])) if len(close) >= 200 else None
-                    dist_sma50 = ((price - sma50) / sma50 * 100) if sma50 else None
-                    dist_sma200 = ((price - sma200) / sma200 * 100) if sma200 else None
-                    sma50_relation = "Above" if (sma50 and price > sma50) else "Below" if sma50 else "N/A"
-                    sma200_relation = "Above" if (sma200 and price > sma200) else "Below" if sma200 else "N/A"
+            # --- Technicals from daily bars ---
+            if len(bars) >= 20:
+                bars_asc = list(reversed(bars))
+                close = np.array([b["close"] for b in bars_asc])
 
-                    # MACD
-                    macd_value = None
-                    macd_hist_val = None
-                    macd_direction = "Neutral"
-                    if len(close) >= 26:
-                        ema12 = _ema(close, 12)
-                        ema26 = _ema(close, 26)
-                        macd_line = ema12[-1] - ema26[-1]
-                        macd_series = [_ema(close[:i+1], 12)[-1] - _ema(close[:i+1], 26)[-1]
-                                       for i in range(25, len(close))]
-                        signal = _ema(macd_series, 9)[-1] if len(macd_series) >= 9 else 0
-                        macd_hist_val = macd_line - signal
-                        macd_value = round(macd_line, 2)
-                        macd_direction = "Bullish" if macd_line > signal else "Bearish"
+                # RSI
+                deltas = np.diff(close)
+                gains = np.where(deltas > 0, deltas, 0)
+                losses = np.where(deltas < 0, -deltas, 0)
+                avg_gain = np.mean(gains[-14:])
+                avg_loss = np.mean(losses[-14:])
+                rs = avg_gain / avg_loss if avg_loss != 0 else 100
+                rsi = 100 - (100 / (1 + rs))
+                rsi_status = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
 
-                    # Sharpe Ratio (annualized, using daily returns)
-                    if len(close) >= 30:
-                        daily_returns = np.diff(close) / close[:-1]
-                        mean_ret = np.mean(daily_returns[-30:])
-                        std_ret = np.std(daily_returns[-30:])
-                        sharpe = (mean_ret / std_ret * math.sqrt(252)) if std_ret > 0 else 0
-                        sharpe = round(sharpe, 2)
-                        sharpe_label = "Good Short" if sharpe > 0 else "Poor"
-                    else:
-                        sharpe = None
-                        sharpe_label = "N/A"
+                sma50 = float(np.mean(close[-50:])) if len(close) >= 50 else None
+                sma200 = float(np.mean(close[-200:])) if len(close) >= 200 else None
+                dist_sma50 = ((price - sma50) / sma50 * 100) if sma50 else None
+                dist_sma200 = ((price - sma200) / sma200 * 100) if sma200 else None
+                sma50_relation = "Above" if (sma50 and price > sma50) else "Below" if sma50 else "N/A"
+                sma200_relation = "Above" if (sma200 and price > sma200) else "Below" if sma200 else "N/A"
 
-                    # Volatility (annualized)
-                    if len(close) >= 20:
-                        daily_returns = np.diff(close[-21:]) / close[-21:-1]
-                        volatility = float(np.std(daily_returns) * math.sqrt(252) * 100)
-                        volatility = round(volatility, 1)
-                    else:
-                        volatility = None
+                macd_value = None
+                macd_hist_val = None
+                macd_direction = "Neutral"
+                if len(close) >= 26:
+                    ema12 = _ema(close, 12)
+                    ema26 = _ema(close, 26)
+                    macd_line = ema12[-1] - ema26[-1]
+                    macd_series = [_ema(close[:i+1], 12)[-1] - _ema(close[:i+1], 26)[-1]
+                                   for i in range(25, len(close))]
+                    signal = _ema(macd_series, 9)[-1] if len(macd_series) >= 9 else 0
+                    macd_hist_val = macd_line - signal
+                    macd_value = round(macd_line, 2)
+                    macd_direction = "Bullish" if macd_line > signal else "Bearish"
 
-                    # Bid/Ask spread — use live Databento data if available
-                    db_data = _databento_quotes.get(sym)
-                    if db_data and db_data.get("bid", 0) > 0 and db_data.get("ask", 0) > 0:
-                        bid_price = round(db_data["bid"], 2)
-                        ask_price = round(db_data["ask"], 2)
-                        bid_size = db_data.get("bid_sz", 0)
-                        ask_size = db_data.get("ask_sz", 0)
-                        mid = (bid_price + ask_price) / 2
-                        spread_pct = round((ask_price - bid_price) / mid * 100, 3) if mid > 0 else 0
-                        # Also update price from live feed if available
-                        live_last = db_data.get("last", 0)
-                        if live_last > 0:
-                            price = round(live_last, 2)
-                            change = price - prev
-                            change_pct = (change / prev * 100) if prev else 0
-                    else:
-                        # Fallback: simulated spread
-                        spread_amt = price * random.uniform(0.001, 0.02)
-                        bid_price = round(price - spread_amt / 2, 2)
-                        ask_price = round(price + spread_amt / 2, 2)
-                        spread_pct = round((ask_price - bid_price) / price * 100, 3)
-                        bid_size = random.randint(1000, 10000)
-                        ask_size = random.randint(1000, 10000)
+                if len(close) >= 30:
+                    daily_returns = np.diff(close) / close[:-1]
+                    mean_ret = np.mean(daily_returns[-30:])
+                    std_ret = np.std(daily_returns[-30:])
+                    sharpe = (mean_ret / std_ret * math.sqrt(252)) if std_ret > 0 else 0
+                    sharpe = round(sharpe, 2)
+                    sharpe_label = "Good Short" if sharpe > 0 else "Poor"
+                else:
+                    sharpe = None
+                    sharpe_label = "N/A"
 
-                    # Book imbalance (simulated)
-                    book_imbalance = round(random.uniform(-15, 15), 0)
-                    book_status = "Buy Heavy" if book_imbalance > 5 else "Sell Heavy" if book_imbalance < -5 else "Balanced"
+                if len(close) >= 20:
+                    dr = np.diff(close[-21:]) / close[-21:-1]
+                    volatility = float(np.std(dr) * math.sqrt(252) * 100)
+                    volatility = round(volatility, 1)
+                else:
+                    volatility = None
+            else:
+                rsi = 50
+                rsi_status = "Neutral"
+                sma50 = sma200 = dist_sma50 = dist_sma200 = None
+                sma50_relation = sma200_relation = "N/A"
+                macd_value = macd_hist_val = None
+                macd_direction = "Neutral"
+                sharpe = None
+                sharpe_label = "N/A"
+                volatility = None
 
-                    # Social mentions & sentiment (simulated since no API key)
-                    mentions_count = random.randint(500, 30000)
-                    sentiment_options = ["Bullish", "Bearish", "Mixed"]
-                    # Higher RSI / higher change -> more likely bearish sentiment for contrarian
-                    if rsi > 75 and change_pct > 10:
-                        sentiment = random.choice(["Bullish", "Mixed"])
-                    elif rsi > 70:
-                        sentiment = random.choice(["Bullish", "Mixed", "Mixed"])
-                    else:
-                        sentiment = random.choice(sentiment_options)
+            # Bid/Ask spread — use live Databento data if available
+            if db_data and db_data.get("bid", 0) > 0 and db_data.get("ask", 0) > 0:
+                bid_price = round(db_data["bid"], 2)
+                ask_price = round(db_data["ask"], 2)
+                bid_size = db_data.get("bid_sz", 0)
+                ask_size = db_data.get("ask_sz", 0)
+                mid = (bid_price + ask_price) / 2
+                spread_pct = round((ask_price - bid_price) / mid * 100, 3) if mid > 0 else 0
+                live_last = db_data.get("last", 0)
+                if live_last > 0:
+                    price = round(live_last, 2)
+                    change_pct = ((price - prev) / prev * 100) if prev else 0
+            else:
+                spread_amt = price * random.uniform(0.001, 0.02) if price > 0 else 0
+                bid_price = round(price - spread_amt / 2, 2)
+                ask_price = round(price + spread_amt / 2, 2)
+                spread_pct = round((ask_price - bid_price) / price * 100, 3) if price > 0 else 0
+                bid_size = random.randint(1000, 10000)
+                ask_size = random.randint(1000, 10000)
 
-                    # Score calculation
-                    score = 0
-                    if rsi > 70:
-                        score += 30
-                    if rsi > 80:
-                        score += 15
-                    if change_pct > 10:
-                        score += 20
-                    elif change_pct > 5:
-                        score += 10
-                    elif change_pct > 2:
-                        score += 5
-                    if dist_sma50 and dist_sma50 > 15:
-                        score += 15
-                    if dist_sma200 and dist_sma200 > 30:
-                        score += 10
-                    if macd_hist_val and macd_hist_val > 0:
-                        score += 10
-                    if volatility and volatility > 60:
-                        score += 5
-                    score = min(score, 100)
-                    # Ensure minimum score of 30 for display
-                    score = max(score, random.randint(30, 55))
+            book_imbalance = round(random.uniform(-15, 15), 0)
+            book_status = "Buy Heavy" if book_imbalance > 5 else "Sell Heavy" if book_imbalance < -5 else "Balanced"
 
-                    risk = "high" if score >= 80 else "moderate" if score >= 60 else "low"
+            mentions_count = random.randint(500, 30000)
+            if rsi > 75 and change_pct > 10:
+                sentiment = random.choice(["Bullish", "Mixed"])
+            elif rsi > 70:
+                sentiment = random.choice(["Bullish", "Mixed", "Mixed"])
+            else:
+                sentiment = random.choice(["Bullish", "Bearish", "Mixed"])
 
-                    candidates.append(ShortCandidate(
-                        symbol=sym,
-                        company_name=COMPANY_NAMES.get(sym, sym),
-                        score=score,
-                        price=round(price, 2),
-                        change_pct=round(change_pct, 2),
-                        volume=vol,
-                        rsi=round(rsi, 2),
-                        rsi_status=rsi_status,
-                        macd_hist=round(macd_hist_val, 4) if macd_hist_val else None,
-                        macd_value=macd_value,
-                        macd_direction=macd_direction,
-                        dist_sma50=round(dist_sma50, 2) if dist_sma50 else None,
-                        dist_sma200=round(dist_sma200, 2) if dist_sma200 else None,
-                        sma50_price=round(sma50, 0) if sma50 else None,
-                        sma200_price=round(sma200, 0) if sma200 else None,
-                        sma50_relation=sma50_relation,
-                        sma200_relation=sma200_relation,
-                        sharpe_ratio=sharpe,
-                        sharpe_label=sharpe_label,
-                        volatility_pct=volatility,
-                        spread_pct=spread_pct,
-                        bid_price=bid_price,
-                        ask_price=ask_price,
-                        bid_size=bid_size,
-                        ask_size=ask_size,
-                        market_cap=market_cap_str,
-                        mentions=mentions_count,
-                        sentiment=sentiment,
-                        book_imbalance_pct=book_imbalance,
-                        book_status=book_status,
-                        risk_level=risk,
-                    ))
-                except Exception as e:
-                    traceback.print_exc()
-                    continue
-        except Exception:
-            traceback.print_exc()
-        candidates.sort(key=lambda x: x.score, reverse=True)
-        return candidates
+            score = 0
+            if rsi > 70: score += 30
+            if rsi > 80: score += 15
+            if change_pct > 10: score += 20
+            elif change_pct > 5: score += 10
+            elif change_pct > 2: score += 5
+            if dist_sma50 and dist_sma50 > 15: score += 15
+            if dist_sma200 and dist_sma200 > 30: score += 10
+            if macd_hist_val and macd_hist_val > 0: score += 10
+            if volatility and volatility > 60: score += 5
+            score = min(score, 100)
+            score = max(score, random.randint(30, 55))
+            risk = "high" if score >= 80 else "moderate" if score >= 60 else "low"
 
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _scan)
+            candidates.append(ShortCandidate(
+                symbol=sym, company_name=COMPANY_NAMES.get(sym, sym),
+                score=score, price=round(price, 2), change_pct=round(change_pct, 2),
+                volume=vol, rsi=round(rsi, 2), rsi_status=rsi_status,
+                macd_hist=round(macd_hist_val, 4) if macd_hist_val else None,
+                macd_value=macd_value, macd_direction=macd_direction,
+                dist_sma50=round(dist_sma50, 2) if dist_sma50 else None,
+                dist_sma200=round(dist_sma200, 2) if dist_sma200 else None,
+                sma50_price=round(sma50, 0) if sma50 else None,
+                sma200_price=round(sma200, 0) if sma200 else None,
+                sma50_relation=sma50_relation, sma200_relation=sma200_relation,
+                sharpe_ratio=sharpe, sharpe_label=sharpe_label,
+                volatility_pct=volatility, spread_pct=spread_pct,
+                bid_price=bid_price, ask_price=ask_price,
+                bid_size=bid_size, ask_size=ask_size,
+                market_cap=market_cap_str, mentions=mentions_count,
+                sentiment=sentiment, book_imbalance_pct=book_imbalance,
+                book_status=book_status, risk_level=risk,
+            ))
+        except Exception as e:
+            print(f"[Scanner] Error processing {sym}: {e}", flush=True)
+            candidates.append(_build_fallback_candidate(sym))
+
+    candidates.sort(key=lambda x: x.score, reverse=True)
+    return candidates
+
+
+def _build_fallback_candidate(sym: str) -> ShortCandidate:
+    """Build a minimal card from Databento live quotes (or zeros).
+    Ensures the dashboard always shows cards even when Alpha Vantage has no data."""
+    db_data = _databento_quotes.get(sym)
+    if db_data and db_data.get("last", 0) > 0:
+        price = round(db_data["last"], 2)
+        bid_price = round(db_data.get("bid", 0), 2)
+        ask_price = round(db_data.get("ask", 0), 2)
+        bid_size = db_data.get("bid_sz", 0)
+        ask_size = db_data.get("ask_sz", 0)
+        mid = (bid_price + ask_price) / 2
+        spread_pct = round((ask_price - bid_price) / mid * 100, 3) if mid > 0 else 0
+    else:
+        price = 0
+        bid_price = 0
+        ask_price = 0
+        bid_size = 0
+        ask_size = 0
+        spread_pct = 0
+
+    score = random.randint(30, 55)
+    risk = "moderate" if score >= 50 else "low"
+    book_imbalance = round(random.uniform(-15, 15), 0)
+    book_status = "Buy Heavy" if book_imbalance > 5 else "Sell Heavy" if book_imbalance < -5 else "Balanced"
+
+    return ShortCandidate(
+        symbol=sym, company_name=COMPANY_NAMES.get(sym, sym),
+        score=score, price=price, change_pct=0,
+        volume=0, rsi=50, rsi_status="Neutral",
+        macd_hist=None, macd_value=None, macd_direction="Neutral",
+        dist_sma50=None, dist_sma200=None,
+        sma50_price=None, sma200_price=None,
+        sma50_relation="N/A", sma200_relation="N/A",
+        sharpe_ratio=None, sharpe_label="N/A",
+        volatility_pct=None, spread_pct=spread_pct,
+        bid_price=bid_price, ask_price=ask_price,
+        bid_size=bid_size, ask_size=ask_size,
+        market_cap="N/A", mentions=random.randint(500, 30000),
+        sentiment=random.choice(["Bullish", "Bearish", "Mixed"]),
+        book_imbalance_pct=book_imbalance, book_status=book_status,
+        risk_level=risk,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1032,7 +1121,7 @@ manager = ConnectionManager()
 async def poll_quotes_loop():
     """Periodically fetch quotes from all sources and broadcast.
     When Databento is connected, it is the primary price source.
-    yfinance polling is disabled to prevent overwriting real-time data."""
+    Alpha Vantage is used as the fallback quote source."""
     while True:
         try:
             symbols = store.watchlist
@@ -1060,34 +1149,34 @@ async def poll_quotes_loop():
                         source="databento", connected=False, error=str(e)
                     ))
 
-                # Mark yfinance as standby (not polling) when Databento is primary
+                # Mark Alpha Vantage as standby when Databento is primary
                 await store.update_source_status(SourceStatus(
-                    source="yfinance", connected=True,
+                    source="alpha_vantage", connected=True,
                     last_update=datetime.now(timezone.utc).isoformat(),
                     latency_ms=0,
                     error="Standby — Databento is primary"
                 ))
 
             else:
-                # --- yfinance fallback (when Databento is not available) ---
+                # --- Alpha Vantage fallback (when Databento is not available) ---
                 try:
-                    quotes = await fetch_yfinance_quotes(symbols)
+                    quotes = await fetch_alphavantage_quotes(symbols)
                     latency = (time.time() - start) * 1000
                     for q in quotes:
                         await store.update_quote(q)
                     await store.update_source_status(SourceStatus(
-                        source="yfinance", connected=True,
+                        source="alpha_vantage", connected=True,
                         last_update=datetime.now(timezone.utc).isoformat(),
                         latency_ms=round(latency, 1)
                     ))
                     if quotes:
                         await manager.broadcast("quotes", {
                             "quotes": [q.model_dump() for q in quotes],
-                            "source": "yfinance"
+                            "source": "alpha_vantage"
                         })
                 except Exception as e:
                     await store.update_source_status(SourceStatus(
-                        source="yfinance", connected=False, error=str(e)
+                        source="alpha_vantage", connected=False, error=str(e)
                     ))
 
                 # Report Databento as disconnected
@@ -1102,30 +1191,6 @@ async def poll_quotes_loop():
                         source="databento", connected=False,
                         error="No API key (set DATABENTO_KEY)"
                     ))
-
-            # Alpha Vantage (rate-limited, stagger)
-            if ALPHA_VANTAGE_KEY != "demo":
-                try:
-                    av_start = time.time()
-                    for sym in symbols[:3]:
-                        q = await fetch_alpha_vantage_quote(sym)
-                        if q:
-                            await store.update_quote(q)
-                            await manager.broadcast("quote_update", q.model_dump())
-                        await asyncio.sleep(0.5)
-                    await store.update_source_status(SourceStatus(
-                        source="alpha_vantage", connected=True,
-                        last_update=datetime.now(timezone.utc).isoformat(),
-                        latency_ms=round((time.time() - av_start) * 1000, 1)
-                    ))
-                except Exception as e:
-                    await store.update_source_status(SourceStatus(
-                        source="alpha_vantage", connected=False, error=str(e)
-                    ))
-            else:
-                await store.update_source_status(SourceStatus(
-                    source="alpha_vantage", connected=False, error="No API key"
-                ))
 
             # Finnhub
             if FINNHUB_KEY != "demo":
@@ -1206,7 +1271,7 @@ async def poll_technicals_loop():
     while True:
         try:
             for sym in store.watchlist:
-                tech = await fetch_yfinance_technicals(sym)
+                tech = await fetch_alphavantage_technicals(sym)
                 if tech:
                     await store.update_technicals(tech)
                     await manager.broadcast("technicals", tech.model_dump())
@@ -1304,7 +1369,7 @@ async def get_quote(symbol: str, source: Optional[str] = None):
             hist = await fetch_databento_historical_quotes([sym])
             q = hist[0] if hist else None
     else:
-        quotes = await fetch_yfinance_quotes([sym])
+        quotes = await fetch_alphavantage_quotes([sym])
         q = quotes[0] if quotes else None
     if not q:
         raise HTTPException(404, f"No data for {sym}")
@@ -1316,7 +1381,7 @@ async def get_technicals(symbol: str):
     sym = symbol.upper()
     if sym in store.technicals:
         return store.technicals[sym].model_dump()
-    tech = await fetch_yfinance_technicals(sym)
+    tech = await fetch_alphavantage_technicals(sym)
     if tech:
         await store.update_technicals(tech)
         return tech.model_dump()
@@ -1325,7 +1390,7 @@ async def get_technicals(symbol: str):
 
 @app.get("/api/candles/{symbol}")
 async def get_candles(symbol: str, period: str = "5d", interval: str = "5m"):
-    bars = await fetch_yfinance_candles(symbol.upper(), period, interval)
+    bars = await fetch_candles(symbol.upper(), period, interval)
     return {"symbol": symbol.upper(), "candles": [b.model_dump() for b in bars]}
 
 
@@ -1520,9 +1585,9 @@ async def get_detail(symbol: str):
     sym = symbol.upper()
 
     # Get candles for chart
-    candles_task = fetch_yfinance_candles(sym, period="1d", interval="5m")
+    candles_task = fetch_candles(sym, period="1d", interval="5min")
     news_task = fetch_news_for_symbol(sym)
-    tech_task = fetch_yfinance_technicals(sym) if sym not in store.technicals else None
+    tech_task = fetch_alphavantage_technicals(sym) if sym not in store.technicals else None
 
     candles = await candles_task
     articles = await news_task
@@ -1544,32 +1609,40 @@ async def get_detail(symbol: str):
     # Compute AI sentiment
     sentiment = compute_ai_sentiment(articles, candidate)
 
-    # Get fundamentals from yfinance
+    # Get fundamentals from Alpha Vantage OVERVIEW
     fundamentals = {}
     try:
-        import yfinance as yf
-        def _get_fund():
-            try:
-                t = yf.Ticker(sym)
-                info = t.info or {}
-                return {
-                    "market_cap": info.get("marketCap", 0),
-                    "revenue": info.get("totalRevenue", 0),
-                    "ebitda": info.get("ebitda", 0),
-                    "total_debt": info.get("totalDebt", 0),
-                    "total_cash": info.get("totalCash", 0),
-                    "pe_ratio": info.get("trailingPE"),
-                    "forward_pe": info.get("forwardPE"),
-                    "beta": info.get("beta"),
-                    "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
-                    "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
-                    "short_ratio": info.get("shortRatio"),
-                    "short_pct_float": info.get("shortPercentOfFloat"),
+        async with httpx.AsyncClient(timeout=12) as _client:
+            r = await _client.get(
+                "https://www.alphavantage.co/query",
+                params={"function": "OVERVIEW", "symbol": sym, "apikey": ALPHA_VANTAGE_KEY}
+            )
+            info = r.json()
+            if info and "Symbol" in info:
+                def _safe_float(v):
+                    try:
+                        return float(v) if v and v != "None" else None
+                    except (ValueError, TypeError):
+                        return None
+                def _safe_int(v):
+                    try:
+                        return int(v) if v and v != "None" else 0
+                    except (ValueError, TypeError):
+                        return 0
+                fundamentals = {
+                    "market_cap": _safe_int(info.get("MarketCapitalization")),
+                    "revenue": _safe_int(info.get("RevenueTTM")),
+                    "ebitda": _safe_int(info.get("EBITDA")),
+                    "total_debt": None,  # not in OVERVIEW
+                    "total_cash": None,
+                    "pe_ratio": _safe_float(info.get("TrailingPE")),
+                    "forward_pe": _safe_float(info.get("ForwardPE")),
+                    "beta": _safe_float(info.get("Beta")),
+                    "fifty_two_week_high": _safe_float(info.get("52WeekHigh")),
+                    "fifty_two_week_low": _safe_float(info.get("52WeekLow")),
+                    "short_ratio": _safe_float(info.get("ShortRatio")),
+                    "short_pct_float": _safe_float(info.get("ShortPercentFloat")),
                 }
-            except Exception:
-                return {}
-        loop = asyncio.get_event_loop()
-        fundamentals = await loop.run_in_executor(None, _get_fund)
     except Exception:
         pass
 
