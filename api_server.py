@@ -554,6 +554,12 @@ _databento_error: Optional[str] = None
 _databento_record_count = 0  # debug counter
 _databento_symbol_map: dict[int, str] = {}  # instrument_id -> symbol
 
+# Trailing tick history buffer — stores last N ticks per symbol for detail chart
+# Each entry: {"t": ISO timestamp, "bid": float, "ask": float, "last": float}
+from collections import deque
+_TICK_HISTORY_MAX = 500  # ~8 min at 1 tick/sec
+_databento_tick_history: dict[str, deque] = {}  # symbol -> deque of tick dicts
+
 
 async def databento_start_live_stream(symbols: list[str]):
     """Start a Databento live streaming session using mbp-1 schema.
@@ -640,6 +646,16 @@ async def databento_start_live_stream(symbols: list[str]):
                         }
                         _databento_last_update = ts
                         _databento_record_count += 1
+
+                        # Append to trailing tick history buffer
+                        if sym not in _databento_tick_history:
+                            _databento_tick_history[sym] = deque(maxlen=_TICK_HISTORY_MAX)
+                        _databento_tick_history[sym].append({
+                            "t": ts,
+                            "bid": round(bid_px, 4),
+                            "ask": round(ask_px, 4),
+                            "last": round(last, 4),
+                        })
 
                         # Log first few records for debugging
                         if _databento_record_count <= 5:
@@ -1418,6 +1434,22 @@ async def get_candles(symbol: str, period: str = "5d", interval: str = "5m"):
     return {"symbol": symbol.upper(), "candles": [b.model_dump() for b in bars]}
 
 
+@app.get("/api/ticks/{symbol}")
+async def get_ticks(symbol: str, limit: int = 300):
+    """Return trailing Databento tick history (bid/ask/last) for the detail chart."""
+    sym = symbol.upper()
+    ticks = list(_databento_tick_history.get(sym, []))
+    # Downsample if we have way more ticks than requested
+    if len(ticks) > limit:
+        step = len(ticks) / limit
+        ticks = [ticks[int(i * step)] for i in range(limit)]
+    return {
+        "symbol": sym,
+        "source": "databento" if ticks else "none",
+        "ticks": ticks,
+    }
+
+
 @app.get("/api/scanner")
 async def get_scanner():
     return {"candidates": [c.model_dump() for c in store.short_candidates]}
@@ -1684,7 +1716,9 @@ async def get_detail(symbol: str):
         "fundamentals": fundamentals,
         "sentiment": sentiment,
         "news": articles,
-        "candles": [{"time": c.timestamp, "open": c.open, "high": c.high, "low": c.low, "close": c.close, "volume": c.volume} for c in candles[-50:]],  # Last 50 bars
+        "candles": [{"time": c.timestamp, "open": c.open, "high": c.high, "low": c.low, "close": c.close, "volume": c.volume} for c in candles[-50:]],  # Last 50 bars (AV fallback)
+        "ticks": list(_databento_tick_history.get(sym, []))[-300:],  # Trailing Databento bid/ask/last
+        "tick_source": "databento" if sym in _databento_tick_history and len(_databento_tick_history[sym]) > 0 else "none",
     }
 
 

@@ -577,6 +577,7 @@ const $detailOverlay = document.getElementById("detail-overlay");
 const $detailBackdrop = document.getElementById("detail-backdrop");
 const $detailClose = document.getElementById("dp-close");
 let detailSymbol = null;
+let detailTickTimer = null;
 
 function openDetailPanel(symbol) {
   detailSymbol = symbol;
@@ -601,12 +602,27 @@ function openDetailPanel(symbol) {
       console.warn("Detail fetch error:", err);
       document.getElementById("dp-news-feed").innerHTML = '<div class="dp-loading">Error loading data</div>';
     });
+
+  // Auto-refresh tick chart every 3s while panel is open
+  if (detailTickTimer) clearInterval(detailTickTimer);
+  detailTickTimer = setInterval(function () {
+    if (!detailSymbol) return;
+    fetch(`${API}/api/ticks/${detailSymbol}`)
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.ticks && data.ticks.length >= 2) {
+          renderTickChart(data.ticks);
+        }
+      })
+      .catch(function () { /* silent */ });
+  }, 3000);
 }
 
 function closeDetailPanel() {
   $detailOverlay.classList.remove("visible");
   document.body.style.overflow = "";
   detailSymbol = null;
+  if (detailTickTimer) { clearInterval(detailTickTimer); detailTickTimer = null; }
   setTimeout(function () {
     $detailOverlay.classList.add("hidden");
   }, 350);
@@ -687,8 +703,12 @@ function renderDetailPanel(data) {
   // News
   renderNewsFeed(data.news || []);
 
-  // Chart
-  renderPriceChart(data.candles || []);
+  // Chart — prefer Databento ticks (bid/ask/last), fall back to AV candles
+  if (data.ticks && data.ticks.length >= 2) {
+    renderTickChart(data.ticks);
+  } else {
+    renderPriceChart(data.candles || []);
+  }
 }
 
 function renderFundamentals(fund) {
@@ -773,6 +793,147 @@ function renderNewsFeed(articles) {
   document.getElementById("dp-news-feed").innerHTML = html;
 }
 
+// ---------------------------------------------------------------------------
+// Databento Tick Chart — 3 lines: bid (blue), ask (red), last (green)
+// ---------------------------------------------------------------------------
+function renderTickChart(ticks) {
+  const canvas = document.getElementById("dp-chart");
+  const ctx = canvas.getContext("2d");
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width - 24;
+  canvas.height = rect.height - 24;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!ticks || ticks.length < 2) {
+    ctx.fillStyle = "#64748b";
+    ctx.font = "13px Inter, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Waiting for Databento ticks...", canvas.width / 2, canvas.height / 2);
+    return;
+  }
+
+  var bids = ticks.map(function (t) { return t.bid; });
+  var asks = ticks.map(function (t) { return t.ask; });
+  var lasts = ticks.map(function (t) { return t.last; });
+  var allPrices = bids.concat(asks, lasts).filter(function (p) { return p > 0; });
+
+  var minP = Math.min.apply(null, allPrices);
+  var maxP = Math.max.apply(null, allPrices);
+  var range = maxP - minP;
+  if (range < 0.01) { range = 0.01; } // prevent flat chart
+
+  var w = canvas.width;
+  var h = canvas.height;
+  var padTop = 14;
+  var padBottom = 24;
+  var padLeft = 55;
+  var padRight = 10;
+  var plotW = w - padLeft - padRight;
+  var plotH = h - padTop - padBottom;
+  var n = ticks.length;
+
+  // Map price to Y
+  function yOf(price) {
+    return padTop + (1 - (price - minP) / range) * plotH;
+  }
+  // Map index to X
+  function xOf(i) {
+    return padLeft + (i / (n - 1)) * plotW;
+  }
+
+  // Y-axis labels + grid
+  ctx.fillStyle = "#64748b";
+  ctx.font = "10px JetBrains Mono, monospace";
+  ctx.textAlign = "right";
+  for (var yi = 0; yi <= 4; yi++) {
+    var yVal = minP + range * (1 - yi / 4);
+    var yPos = padTop + plotH * (yi / 4);
+    ctx.fillText("$" + yVal.toFixed(2), padLeft - 6, yPos + 3);
+    ctx.strokeStyle = "rgba(255,255,255,0.04)";
+    ctx.beginPath();
+    ctx.moveTo(padLeft, yPos);
+    ctx.lineTo(w - padRight, yPos);
+    ctx.stroke();
+  }
+
+  // Draw a line series
+  function drawLine(series, color, lineW) {
+    ctx.beginPath();
+    var started = false;
+    for (var i = 0; i < n; i++) {
+      if (series[i] <= 0) continue;
+      var px = xOf(i);
+      var py = yOf(series[i]);
+      if (!started) { ctx.moveTo(px, py); started = true; }
+      else { ctx.lineTo(px, py); }
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineW;
+    ctx.stroke();
+  }
+
+  // Bid/Ask spread fill (shaded area between bid and ask)
+  ctx.beginPath();
+  for (var i = 0; i < n; i++) {
+    if (asks[i] <= 0 || bids[i] <= 0) continue;
+    var px = xOf(i);
+    if (i === 0) ctx.moveTo(px, yOf(asks[i]));
+    else ctx.lineTo(px, yOf(asks[i]));
+  }
+  for (var i = n - 1; i >= 0; i--) {
+    if (asks[i] <= 0 || bids[i] <= 0) continue;
+    ctx.lineTo(xOf(i), yOf(bids[i]));
+  }
+  ctx.closePath();
+  ctx.fillStyle = "rgba(100,116,139,0.12)";
+  ctx.fill();
+
+  // Draw lines: bid (blue), ask (red/orange), last (green)
+  drawLine(bids, "#60a5fa", 1.5);  // blue
+  drawLine(asks, "#f97316", 1.5);  // orange
+  drawLine(lasts, "#34d399", 2);   // green (prominent)
+
+  // X-axis time labels
+  ctx.fillStyle = "#64748b";
+  ctx.font = "10px Inter, sans-serif";
+  ctx.textAlign = "center";
+  var step = Math.max(1, Math.floor(n / 6));
+  for (var xi = 0; xi < n; xi += step) {
+    var xp = xOf(xi);
+    var ts = ticks[xi].t || "";
+    try {
+      var dt = new Date(ts);
+      ts = dt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", second: "2-digit" });
+    } catch (e) { /* keep raw */ }
+    ctx.fillText(ts, xp, h - 4);
+  }
+
+  // Legend
+  var legendX = padLeft + 8;
+  var legendY = padTop + 10;
+  var legends = [
+    { color: "#60a5fa", label: "Bid" },
+    { color: "#f97316", label: "Ask" },
+    { color: "#34d399", label: "Last" },
+  ];
+  ctx.font = "10px Inter, sans-serif";
+  ctx.textAlign = "left";
+  for (var li = 0; li < legends.length; li++) {
+    var lx = legendX + li * 60;
+    ctx.strokeStyle = legends[li].color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(lx, legendY);
+    ctx.lineTo(lx + 16, legendY);
+    ctx.stroke();
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillText(legends[li].label, lx + 20, legendY + 3);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AV Candle Chart (fallback when no Databento ticks)
+// ---------------------------------------------------------------------------
 function renderPriceChart(candles) {
   const canvas = document.getElementById("dp-chart");
   const ctx = canvas.getContext("2d");
