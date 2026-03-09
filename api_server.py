@@ -6,7 +6,6 @@ Sources: Alpha Vantage (primary), Databento (real-time), Finnhub, Bookmap/dxFeed
 """
 import asyncio
 import json
-import threading
 import time
 import os
 import random
@@ -549,7 +548,6 @@ async def fetch_nasdaq_index() -> Optional[NASDAQIndex]:
 # State for Databento live stream
 _databento_live_client = None
 _databento_quotes: dict[str, dict] = {}  # symbol -> {bid, ask, bid_sz, ask_sz, last, ts}
-_databento_quotes_lock = threading.Lock()
 _databento_connected = False
 _databento_last_update: Optional[str] = None
 _databento_error: Optional[str] = None
@@ -567,12 +565,16 @@ async def databento_start_live_stream(symbols: list[str]):
         _databento_error = "No API key (set DATABENTO_KEY)"
         return
 
+    import threading
+
     def _run_stream():
         global _databento_live_client, _databento_connected, _databento_last_update, _databento_error, _databento_record_count
-        try:
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+          try:
             import databento as db
 
-            print(f"[Databento] Connecting to {DATABENTO_LIVE_DATASET} mbp-1 for {len(symbols)} symbols...", flush=True)
+            print(f"[Databento] Connecting to {DATABENTO_LIVE_DATASET} mbp-1 for {len(symbols)} symbols... (attempt {attempt}/{max_retries})", flush=True)
             _databento_live_client = db.Live(key=DATABENTO_KEY)
 
             # Subscribe to mbp-1 schema (Market By Price, Level 1 = top of book)
@@ -626,27 +628,26 @@ async def databento_start_live_stream(symbols: list[str]):
 
                         ts = datetime.now(timezone.utc).isoformat()
 
-                        with _databento_quotes_lock:
-                            _databento_quotes[sym] = {
-                                "symbol": sym,
-                                "bid": round(bid_px, 4),
-                                "ask": round(ask_px, 4),
-                                "bid_sz": bid_sz,
-                                "ask_sz": ask_sz,
-                                "last": round(last, 4),
-                                "mid": round(mid, 4),
-                                "timestamp": ts,
-                            }
-                            _databento_last_update = ts
-                            _databento_record_count += 1
+                        _databento_quotes[sym] = {
+                            "symbol": sym,
+                            "bid": round(bid_px, 4),
+                            "ask": round(ask_px, 4),
+                            "bid_sz": bid_sz,
+                            "ask_sz": ask_sz,
+                            "last": round(last, 4),
+                            "mid": round(mid, 4),
+                            "timestamp": ts,
+                        }
+                        _databento_last_update = ts
+                        _databento_record_count += 1
 
-                            # Log first few records for debugging
-                            if _databento_record_count <= 5:
-                                print(f"[Databento] MBP1 #{_databento_record_count}: {sym} bid={bid_px:.2f}x{bid_sz} ask={ask_px:.2f}x{ask_sz} last={last:.2f}", flush=True)
-                            elif _databento_record_count == 50:
-                                print(f"[Databento] 50 records received, {len(_databento_quotes)} symbols active", flush=True)
-                            elif _databento_record_count % 500 == 0:
-                                print(f"[Databento] {_databento_record_count} records, {len(_databento_quotes)} symbols", flush=True)
+                        # Log first few records for debugging
+                        if _databento_record_count <= 5:
+                            print(f"[Databento] MBP1 #{_databento_record_count}: {sym} bid={bid_px:.2f}x{bid_sz} ask={ask_px:.2f}x{ask_sz} last={last:.2f}", flush=True)
+                        elif _databento_record_count == 50:
+                            print(f"[Databento] 50 records received, {len(_databento_quotes)} symbols active", flush=True)
+                        elif _databento_record_count % 500 == 0:
+                            print(f"[Databento] {_databento_record_count} records, {len(_databento_quotes)} symbols", flush=True)
 
                 except Exception as e:
                     print(f"[Databento] Record handler error: {e}", flush=True)
@@ -654,12 +655,21 @@ async def databento_start_live_stream(symbols: list[str]):
             _databento_live_client.add_callback(handle_record)
             _databento_live_client.start()
             _databento_live_client.block_for_close()
+            break  # Clean exit — don't retry
 
-        except Exception as e:
+          except Exception as e:
             _databento_connected = False
             _databento_error = str(e)
             print(f"[Databento] Stream error: {e}", flush=True)
             traceback.print_exc()
+            if attempt < max_retries:
+                wait = min(10 * attempt, 60)
+                print(f"[Databento] Retrying in {wait}s...", flush=True)
+                import time as _time
+                _time.sleep(wait)
+                _databento_live_client = None
+            else:
+                print(f"[Databento] All {max_retries} attempts failed. Give up.", flush=True)
 
     # Launch as a daemon thread so it doesn't block server startup or shutdown
     t = threading.Thread(target=_run_stream, daemon=True, name="databento-live")
@@ -764,10 +774,8 @@ async def fetch_databento_historical_quotes(symbols: list[str]) -> list[Quote]:
 
 def _get_databento_quotes_from_live() -> list[Quote]:
     """Convert live mbp-1 cache into Quote objects with real bid/ask."""
-    with _databento_quotes_lock:
-        snapshot = dict(_databento_quotes)
     quotes = []
-    for sym, data in snapshot.items():
+    for sym, data in _databento_quotes.items():
         # Map raw symbols to our watchlist format (strip exchange suffixes if any)
         clean_sym = sym.split('.')[0] if '.' in sym else sym
 
@@ -874,8 +882,7 @@ async def scan_short_candidates() -> list[ShortCandidate]:
             quote = quote_cache.get(sym)
 
             # Get price from AV quote, Databento, or daily bars
-            with _databento_quotes_lock:
-                db_data = _databento_quotes.get(sym)
+            db_data = _databento_quotes.get(sym)
             if quote:
                 price = quote.price
                 prev = quote.prev_close or price
@@ -1042,8 +1049,7 @@ async def scan_short_candidates() -> list[ShortCandidate]:
 def _build_fallback_candidate(sym: str) -> ShortCandidate:
     """Build a minimal card from Databento live quotes (or zeros).
     Ensures the dashboard always shows cards even when Alpha Vantage has no data."""
-    with _databento_quotes_lock:
-        db_data = _databento_quotes.get(sym)
+    db_data = _databento_quotes.get(sym)
     if db_data and db_data.get("last", 0) > 0:
         price = round(db_data["last"], 2)
         bid_price = round(db_data.get("bid", 0), 2)
@@ -1249,7 +1255,11 @@ async def poll_quotes_loop():
         except Exception:
             traceback.print_exc()
 
-        await asyncio.sleep(15)
+        # When Databento is primary, AV quotes poll can be very slow (fallback only)
+        if DATABENTO_KEY and _databento_connected:
+            await asyncio.sleep(300)  # 5 min — AV on standby
+        else:
+            await asyncio.sleep(15)  # 15s — AV is primary source
 
 
 async def poll_databento_realtime_loop():
@@ -1257,9 +1267,7 @@ async def poll_databento_realtime_loop():
     This gives the dashboard real-time price updates when Databento is connected."""
     while True:
         try:
-            with _databento_quotes_lock:
-                has_quotes = bool(_databento_quotes)
-            if DATABENTO_KEY and _databento_connected and has_quotes:
+            if DATABENTO_KEY and _databento_connected and _databento_quotes:
                 db_quotes = _get_databento_quotes_from_live()
                 if db_quotes:
                     for q in db_quotes:
@@ -1285,11 +1293,12 @@ async def poll_technicals_loop():
                 await asyncio.sleep(1)
         except Exception:
             traceback.print_exc()
-        await asyncio.sleep(60)
+        await asyncio.sleep(600)  # 10 min — daily technicals don't change fast
 
 
 async def poll_scanner_loop():
     """Periodically scan for short candidates."""
+    await asyncio.sleep(15)  # Stagger startup — let quotes fetch first
     while True:
         try:
             candidates = await scan_short_candidates()
@@ -1304,6 +1313,7 @@ async def poll_scanner_loop():
 
 async def poll_index_loop():
     """Periodically fetch NASDAQ index."""
+    await asyncio.sleep(5)  # Stagger startup
     while True:
         try:
             idx = await fetch_nasdaq_index()
@@ -1312,7 +1322,7 @@ async def poll_index_loop():
                 await manager.broadcast("index", idx.model_dump())
         except Exception:
             traceback.print_exc()
-        await asyncio.sleep(30)
+        await asyncio.sleep(300)  # 5 min — NASDAQ index via AV
 
 
 # ---------------------------------------------------------------------------
@@ -1615,8 +1625,7 @@ async def get_detail(symbol: str):
 
     # Get live quote from Databento or store
     live_quote = store.quotes.get(sym)
-    with _databento_quotes_lock:
-        db_data = _databento_quotes.get(sym)
+    db_data = _databento_quotes.get(sym)
 
     # Build technicals
     tech_data = store.technicals.get(sym)
@@ -1744,4 +1753,5 @@ if __name__ == "__main__":
         return FileResponse(os.path.join(static_dir, "style.css"), media_type="text/css")
 
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # loop="asyncio" avoids uvloop, which conflicts with Databento's TCP transport
+    uvicorn.run(app, host="0.0.0.0", port=port, loop="asyncio")
