@@ -1107,6 +1107,210 @@ def _build_fallback_candidate(sym: str) -> ShortCandidate:
 
 
 # ---------------------------------------------------------------------------
+# Short Gainers Agent Integration
+# Fetches and parses data from kaos-short.netlify.app (external agent output)
+# ---------------------------------------------------------------------------
+GAINERS_URL = os.getenv("GAINERS_URL", "https://kaos-short.netlify.app")
+_gainers_cache: dict = {"candidates": [], "last_updated": None, "analysis_date": None}
+_gainers_detail_cache: dict[str, dict] = {}  # symbol -> parsed detail data
+
+import re as _re
+
+def _parse_gainers_index(html: str) -> list[dict]:
+    """Parse the Short Gainers Agent index.html table into structured data."""
+    candidates = []
+    # Extract analysis date
+    date_match = _re.search(r'Analysis Date:\s*([\d-]+)', html)
+    analysis_date = date_match.group(1) if date_match else None
+    # Extract last updated
+    updated_match = _re.search(r'Last Updated:\s*([\d:]+\s*[AP]M\s*ET)', html)
+    last_updated = updated_match.group(1).strip() if updated_match else None
+
+    # Parse table rows: each <tr onclick="window.location='TICKER.html'"> ...
+    row_pattern = _re.compile(
+        r"<tr[^>]*onclick=\"window\.location='([^']+)\.html'\"[^>]*>\s*"
+        r"<td>\d+</td>\s*"
+        r"<td><strong>([^<]+)</strong></td>\s*"  # ticker
+        r"<td>([^<]*)</td>\s*"  # company
+        r'<td[^>]*>([\d.]+)</td>\s*'  # score
+        r'<td[^>]*>([^<]+)</td>\s*'  # expression
+        r'<td[^>]*>([^<]+)</td>\s*'  # change
+        r"<td>([^<]*)</td>\s*"  # price
+        r"<td>([^<]*)</td>\s*"  # rsi
+        r"<td>(.*?)</td>",  # flags (may contain spans)
+        _re.DOTALL
+    )
+    for m in row_pattern.finditer(html):
+        flags_html = m.group(9)
+        flags = _re.findall(r'class="flag-mini">([^<]+)<', flags_html)
+        try:
+            change_str = m.group(6).strip().replace('%', '').replace('+', '')
+            change_pct = float(change_str)
+        except (ValueError, TypeError):
+            change_pct = 0.0
+        try:
+            price = float(m.group(7).strip().replace('$', '').replace(',', ''))
+        except (ValueError, TypeError):
+            price = 0.0
+        try:
+            score = float(m.group(4).strip())
+        except (ValueError, TypeError):
+            score = 0.0
+        rsi_str = m.group(8).strip()
+        rsi = float(rsi_str) if rsi_str and rsi_str != 'N/A' else None
+
+        candidates.append({
+            "symbol": m.group(2).strip(),
+            "company": m.group(3).strip(),
+            "score": score,
+            "expression": m.group(5).strip(),
+            "change_pct": change_pct,
+            "price": price,
+            "rsi": rsi,
+            "flags": flags,
+        })
+
+    return candidates, analysis_date, last_updated
+
+
+def _parse_gainers_detail(html: str) -> dict:
+    """Parse a Short Gainers Agent TICKER.html detail page into structured data."""
+    detail = {}
+
+    # Score
+    sm = _re.search(r'class="score-value">([\d.]+)<', html)
+    if sm:
+        detail["score"] = float(sm.group(1))
+
+    # Expression
+    em = _re.search(r'class="expression">[^<]*?([A-Z_ ]+)<', html)
+    if em:
+        expr = em.group(1).strip()
+        # Clean emoji prefixes
+        expr = _re.sub(r'^[^A-Z]*', '', expr).strip()
+        detail["expression"] = expr
+
+    # Price data
+    def _extract_metric(label, html_str):
+        pat = _re.compile(r'class="metric-label">' + _re.escape(label) + r'</span>\s*<span[^>]*>([^<]+)<', _re.DOTALL)
+        m = pat.search(html_str)
+        return m.group(1).strip() if m else None
+
+    detail["current_price"] = _extract_metric("Current Price", html)
+    detail["prior_close"] = _extract_metric("Prior Close", html)
+    detail["intraday_high"] = _extract_metric("Intraday High", html)
+    detail["intraday_low"] = _extract_metric("Intraday Low", html)
+    detail["volume"] = _extract_metric("Volume", html)
+    detail["52_week_range"] = _extract_metric("52-Week Range", html)
+
+    # Technicals
+    detail["rsi"] = _extract_metric("RSI (14)", html)
+    detail["bollinger"] = _extract_metric("Bollinger Position", html)
+    detail["atr"] = _extract_metric("ATR (14)", html)
+    detail["off_high"] = _extract_metric("Off Intraday High", html)
+
+    # Risk flags
+    flags = _re.findall(r'class="flag[^"]*">([^<]+)<', html)
+    detail["risk_flags"] = flags
+
+    # Catalyst
+    detail["catalyst_type"] = _extract_metric("Classification", html)
+    detail["fundamental_catalyst"] = _extract_metric("Fundamental Catalyst", html)
+
+    # Score breakdown
+    detail["technical_score"] = _extract_metric("Technical Score", html)
+    detail["sentiment_adj"] = _extract_metric("Sentiment Adjustment", html)
+
+    # Composite risk
+    detail["composite_risk"] = _extract_metric("Composite Risk", html)
+
+    # Trade structure
+    detail["expression_trade"] = _extract_metric("Expression", html)
+    detail["position_size"] = _extract_metric("Position Size", html)
+    detail["stop_trigger"] = _extract_metric("Stop Trigger", html)
+
+    # Financials
+    detail["revenue"] = _extract_metric("Revenue (TTM)", html)
+    detail["gross_margin"] = _extract_metric("Gross Margin", html)
+    detail["net_income"] = _extract_metric("Net Income", html)
+    detail["ebitda"] = _extract_metric("EBITDA", html)
+    detail["operating_cf"] = _extract_metric("Operating CF", html)
+    detail["cash"] = _extract_metric("Cash", html)
+    detail["total_debt"] = _extract_metric("Total Debt", html)
+    detail["equity"] = _extract_metric("Equity", html)
+    detail["shares_out"] = _extract_metric("Shares Out", html)
+
+    # Valuation
+    detail["implied_mcap"] = _extract_metric("Implied Market Cap", html)
+    detail["price_sales"] = _extract_metric("Price/Sales", html)
+    detail["profitable"] = _extract_metric("Profitable?", html)
+    detail["revenue_growth"] = _extract_metric("Revenue Growth", html)
+
+    # Key levels table
+    levels = _re.findall(r'<td[^>]*class="price"[^>]*>([^<]+)<', html)
+    detail["key_levels"] = [l.strip() for l in levels]
+
+    # Warnings
+    warnings = _re.findall(r'<li><strong>([^<]+)</strong>\s*([^<]+)<', html)
+    detail["warnings"] = [{"title": w[0].strip().rstrip(':'), "text": w[1].strip()} for w in warnings]
+
+    return detail
+
+
+async def fetch_gainers_from_agent():
+    """Fetch the Short Gainers Agent output from Netlify and parse it."""
+    global _gainers_cache, _gainers_detail_cache
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Fetch index page
+            r = await client.get(f"{GAINERS_URL}/index.html")
+            if r.status_code != 200:
+                print(f"[Gainers] Index fetch failed: {r.status_code}", flush=True)
+                return
+            candidates, analysis_date, last_updated = _parse_gainers_index(r.text)
+            _gainers_cache = {
+                "candidates": candidates,
+                "analysis_date": analysis_date,
+                "last_updated": last_updated,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            }
+            print(f"[Gainers] Parsed {len(candidates)} candidates from agent (date={analysis_date}, updated={last_updated})", flush=True)
+
+            # Fetch detail pages for top candidates (score > 0)
+            for c in candidates:
+                sym = c["symbol"]
+                try:
+                    dr = await client.get(f"{GAINERS_URL}/{sym}.html")
+                    if dr.status_code == 200 and len(dr.text) > 500:  # Skip near-empty pages
+                        detail = _parse_gainers_detail(dr.text)
+                        detail["symbol"] = sym
+                        detail["agent_score"] = c["score"]
+                        detail["agent_expression"] = c["expression"]
+                        detail["agent_flags"] = c["flags"]
+                        _gainers_detail_cache[sym] = detail
+                    await asyncio.sleep(0.2)  # Be nice to Netlify
+                except Exception as e:
+                    print(f"[Gainers] Detail fetch error for {sym}: {e}", flush=True)
+
+    except Exception as e:
+        print(f"[Gainers] Fetch error: {e}", flush=True)
+        traceback.print_exc()
+
+
+async def poll_gainers_loop():
+    """Periodically fetch Short Gainers Agent data (every 5 min during market hours)."""
+    await asyncio.sleep(20)  # Stagger startup
+    while True:
+        try:
+            await fetch_gainers_from_agent()
+            if _gainers_cache["candidates"]:
+                await manager.broadcast("gainers", _gainers_cache)
+        except Exception:
+            traceback.print_exc()
+        await asyncio.sleep(300)  # 5 min — agent refreshes every 15 min
+
+
+# ---------------------------------------------------------------------------
 # WebSocket Manager
 # ---------------------------------------------------------------------------
 class ConnectionManager:
@@ -1369,6 +1573,7 @@ async def lifespan(app):
         asyncio.create_task(poll_technicals_loop()),
         asyncio.create_task(poll_scanner_loop()),
         asyncio.create_task(poll_index_loop()),
+        asyncio.create_task(poll_gainers_loop()),
     ]
     yield
     # Cleanup
@@ -1453,6 +1658,25 @@ async def get_ticks(symbol: str, limit: int = 300):
 @app.get("/api/scanner")
 async def get_scanner():
     return {"candidates": [c.model_dump() for c in store.short_candidates]}
+
+
+@app.get("/api/gainers")
+async def get_gainers():
+    """Return Short Gainers Agent candidates (from kaos-short.netlify.app)."""
+    return _gainers_cache
+
+
+@app.get("/api/gainers/{symbol}")
+async def get_gainer_detail(symbol: str):
+    """Return parsed detail data from the Short Gainers Agent for a specific symbol."""
+    sym = symbol.upper()
+    if sym in _gainers_detail_cache:
+        return _gainers_detail_cache[sym]
+    # Check if it's in the candidates list (summary only)
+    for c in _gainers_cache.get("candidates", []):
+        if c["symbol"] == sym:
+            return c
+    raise HTTPException(404, f"No gainers data for {sym}")
 
 
 @app.get("/api/index")
@@ -1719,6 +1943,7 @@ async def get_detail(symbol: str):
         "candles": [{"time": c.timestamp, "open": c.open, "high": c.high, "low": c.low, "close": c.close, "volume": c.volume} for c in candles[-50:]],  # Last 50 bars (AV fallback)
         "ticks": list(_databento_tick_history.get(sym, []))[-300:],  # Trailing Databento bid/ask/last
         "tick_source": "databento" if sym in _databento_tick_history and len(_databento_tick_history[sym]) > 0 else "none",
+        "agent": _gainers_detail_cache.get(sym),  # Short Gainers Agent detail (if available)
     }
 
 
@@ -1740,6 +1965,7 @@ async def ws_endpoint(ws: WebSocket):
                 "watchlist": store.watchlist,
                 "candidates": [c.model_dump() for c in store.short_candidates],
                 "index": store.nasdaq_index.model_dump() if store.nasdaq_index else None,
+                "gainers": _gainers_cache,
             },
             "ts": datetime.now(timezone.utc).isoformat()
         }))

@@ -17,6 +17,9 @@ let state = {
   sources: {},
   wsConnected: false,
   lastUpdate: null,
+  gainers: [],
+  gainersDate: null,
+  gainersUpdated: null,
 };
 
 let ws = null;
@@ -34,6 +37,15 @@ const $avgChange = document.getElementById("avg-change");
 const $liveBadge = document.getElementById("live-badge");
 const $updatedText = document.getElementById("updated-text");
 const $refreshBtn = document.getElementById("refresh-btn");
+const $gainersBadge = document.getElementById("gainers-badge");
+const $gainersGrid = document.getElementById("gainers-grid");
+const $gainersSubtitle = document.getElementById("gainers-subtitle");
+const $tabBar = document.getElementById("tab-bar");
+const $tabWatchlist = document.getElementById("tab-watchlist");
+const $tabGainers = document.getElementById("tab-gainers");
+const $dpAgentSection = document.getElementById("dp-agent-section");
+const $dpAgentGrid = document.getElementById("dp-agent-grid");
+let activeTab = "watchlist";
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -428,7 +440,22 @@ function connectWebSocket() {
           if (msg.data.sources) {
             state.sources = msg.data.sources;
           }
+          // Gainers from WS init
+          if (msg.data.gainers && msg.data.gainers.candidates && msg.data.gainers.candidates.length > 0) {
+            state.gainers = msg.data.gainers.candidates;
+            state.gainersDate = msg.data.gainers.analysis_date || null;
+            state.gainersUpdated = msg.data.gainers.last_updated || null;
+            renderGainersCards();
+          }
           render();
+        } else if (msg.type === "gainers") {
+          // Live gainers broadcast from backend polling
+          if (msg.data && msg.data.candidates && msg.data.candidates.length > 0) {
+            state.gainers = msg.data.candidates;
+            state.gainersDate = msg.data.analysis_date || null;
+            state.gainersUpdated = msg.data.last_updated || null;
+            renderGainersCards();
+          }
         } else if (msg.type === "scanner") {
           if (msg.data.candidates && msg.data.candidates.length > 0) {
             state.candidates = msg.data.candidates.sort((a, b) => b.score - a.score);
@@ -702,6 +729,9 @@ function renderDetailPanel(data) {
 
   // News
   renderNewsFeed(data.news || []);
+
+  // Agent Analysis (Short Gainers Agent data merged into detail response)
+  renderAgentDetail(data.agent || null);
 
   // Chart — prefer Databento ticks (bid/ask/last), fall back to AV candles
   if (data.ticks && data.ticks.length >= 2) {
@@ -1057,11 +1087,200 @@ function renderPriceChart(candles) {
 }
 
 // ---------------------------------------------------------------------------
+// Tab Switching
+// ---------------------------------------------------------------------------
+$tabBar.addEventListener("click", function (e) {
+  var btn = e.target.closest(".tab");
+  if (!btn || !btn.dataset.tab) return;
+  var tab = btn.dataset.tab;
+  if (tab === activeTab) return;
+  activeTab = tab;
+  // Update tab button states
+  $tabBar.querySelectorAll(".tab").forEach(function (t) {
+    t.classList.toggle("active", t.dataset.tab === tab);
+  });
+  // Toggle tab content
+  $tabWatchlist.classList.toggle("active", tab === "watchlist");
+  $tabGainers.classList.toggle("active", tab === "gainers");
+});
+
+// ---------------------------------------------------------------------------
+// Gainers Cards (Short Gainers Agent tab)
+// ---------------------------------------------------------------------------
+function renderGainersCards() {
+  var cands = state.gainers;
+  // Update badge count
+  $gainersBadge.textContent = cands.length > 0 ? String(cands.length) : "";
+  // Update subtitle
+  if (state.gainersDate || state.gainersUpdated) {
+    var parts = [];
+    if (state.gainersDate) parts.push("Analysis: " + state.gainersDate);
+    if (state.gainersUpdated) parts.push("Updated: " + state.gainersUpdated);
+    $gainersSubtitle.textContent = parts.join(" \u2022 ");
+  } else if (cands.length > 0) {
+    $gainersSubtitle.textContent = cands.length + " candidates from Short Gainers Agent";
+  } else {
+    $gainersSubtitle.textContent = "Waiting for agent data...";
+  }
+
+  if (cands.length === 0) {
+    $gainersGrid.innerHTML = '<div class="dp-loading" style="grid-column:1/-1;padding:40px">No Short Gainers Agent data available yet. The agent refreshes every 15 minutes.</div>';
+    return;
+  }
+
+  var html = cands.map(function (c) {
+    var score = c.score || 0;
+    var scoreCls = score >= 7 ? "high" : score >= 5 ? "moderate" : "low";
+    var exprCls = "avoid";
+    var expr = (c.expression || "").toUpperCase();
+    if (expr.indexOf("SHORT SHARES") >= 0) exprCls = "short-shares";
+    else if (expr.indexOf("BUY PUTS") >= 0 || expr.indexOf("PUT") >= 0) exprCls = "buy-puts";
+    else if (expr.indexOf("SPREAD") >= 0) exprCls = "put-spreads";
+
+    var flagsHtml = "";
+    if (c.flags && c.flags.length > 0) {
+      flagsHtml = '<div class="gc-flags">' +
+        c.flags.map(function (f) { return '<span class="gc-flag">' + escapeHtml(f) + '</span>'; }).join("") +
+        '</div>';
+    }
+
+    return '<div class="gainer-card" data-symbol="' + escapeHtml(c.symbol) + '">' +
+      '<div class="gc-header">' +
+        '<span class="gc-symbol">' + escapeHtml(c.symbol) + '</span>' +
+        '<span class="gc-expression ' + exprCls + '">' + escapeHtml(c.expression || "N/A") + '</span>' +
+      '</div>' +
+      '<div class="gc-company">' + escapeHtml(c.company || c.symbol) + '</div>' +
+      '<div class="gc-metrics">' +
+        '<div class="gc-metric"><span class="gc-metric-label">Score</span><span class="gc-metric-value">' + score.toFixed(1) + '/10</span></div>' +
+        '<div class="gc-metric"><span class="gc-metric-label">Change</span><span class="gc-metric-value ' + (c.change_pct >= 0 ? 'text-green' : 'text-red') + '">' + formatPct(c.change_pct) + '</span></div>' +
+        '<div class="gc-metric"><span class="gc-metric-label">Price</span><span class="gc-metric-value">' + (c.price ? formatPrice(c.price) : '\u2014') + '</span></div>' +
+        '<div class="gc-metric"><span class="gc-metric-label">RSI</span><span class="gc-metric-value">' + (c.rsi != null ? Math.round(c.rsi) : '\u2014') + '</span></div>' +
+      '</div>' +
+      '<div class="gc-score-bar"><div class="gc-score-fill ' + scoreCls + '" style="width:' + (score * 10) + '%"></div></div>' +
+      flagsHtml +
+    '</div>';
+  }).join("");
+
+  $gainersGrid.innerHTML = html;
+}
+
+// Click handler for gainer cards — opens detail panel
+$gainersGrid.addEventListener("click", function (e) {
+  var card = e.target.closest(".gainer-card");
+  if (card && card.dataset.symbol) {
+    openDetailPanel(card.dataset.symbol);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Agent Detail Section (in Detail Panel)
+// ---------------------------------------------------------------------------
+function renderAgentDetail(agentData) {
+  if (!agentData) {
+    $dpAgentSection.style.display = "none";
+    return;
+  }
+  $dpAgentSection.style.display = "";
+
+  var html = "";
+
+  // Expression badge
+  var expr = agentData.agent_expression || agentData.expression || "";
+  if (expr) {
+    var exprColor = "#64748b";
+    var exprBg = "rgba(100,116,139,0.2)";
+    var eu = expr.toUpperCase();
+    if (eu.indexOf("SHORT SHARES") >= 0) { exprColor = "#ef4444"; exprBg = "rgba(239,68,68,0.2)"; }
+    else if (eu.indexOf("PUT") >= 0) { exprColor = "#f97316"; exprBg = "rgba(249,115,22,0.2)"; }
+    else if (eu.indexOf("SPREAD") >= 0) { exprColor = "#fbbf24"; exprBg = "rgba(251,191,36,0.2)"; }
+    html += '<div class="dp-agent-expression" style="background:' + exprBg + ';color:' + exprColor + '">' + escapeHtml(expr) + '</div>';
+  }
+
+  // Agent score
+  var agentScore = agentData.agent_score || agentData.score;
+  if (agentScore != null) {
+    var sColor = agentScore >= 7 ? "success" : agentScore >= 5 ? "warning" : "danger";
+    html += '<div class="dp-agent-item" style="grid-column:1/-1"><span class="agent-label">Agent Score</span><span class="agent-value ' + sColor + '">' + Number(agentScore).toFixed(1) + ' / 10</span></div>';
+  }
+
+  // Key metrics in 2-column grid
+  var metrics = [
+    { label: "Catalyst", key: "catalyst_type" },
+    { label: "Composite Risk", key: "composite_risk" },
+    { label: "Technical Score", key: "technical_score" },
+    { label: "Sentiment Adj", key: "sentiment_adj" },
+    { label: "Position Size", key: "position_size" },
+    { label: "Stop Trigger", key: "stop_trigger" },
+    { label: "Off High", key: "off_high" },
+    { label: "ATR (14)", key: "atr" },
+    { label: "Bollinger", key: "bollinger" },
+    { label: "Volume", key: "volume" },
+    { label: "52W Range", key: "52_week_range" },
+  ];
+
+  metrics.forEach(function (m) {
+    var val = agentData[m.key];
+    if (val != null && val !== "" && val !== "N/A") {
+      var valCls = "";
+      // Color-code some values
+      var vl = String(val).toLowerCase();
+      if (vl.indexOf("high") >= 0 || vl.indexOf("extreme") >= 0 || vl.indexOf("overbought") >= 0) valCls = "danger";
+      else if (vl.indexOf("moderate") >= 0 || vl.indexOf("elevated") >= 0) valCls = "warning";
+      else if (vl.indexOf("low") >= 0 || vl.indexOf("oversold") >= 0) valCls = "success";
+      html += '<div class="dp-agent-item"><span class="agent-label">' + escapeHtml(m.label) + '</span><span class="agent-value ' + valCls + '">' + escapeHtml(String(val)) + '</span></div>';
+    }
+  });
+
+  // Fundamental catalyst
+  if (agentData.fundamental_catalyst) {
+    html += '<div class="dp-agent-item" style="grid-column:1/-1"><span class="agent-label">Fundamental Catalyst</span><span class="agent-value">' + escapeHtml(agentData.fundamental_catalyst) + '</span></div>';
+  }
+
+  // Warnings
+  var warnings = agentData.warnings || [];
+  var agentFlags = agentData.agent_flags || agentData.risk_flags || [];
+  if (warnings.length > 0 || agentFlags.length > 0) {
+    var warnHtml = '<div class="dp-agent-warnings">';
+    warnHtml += '<strong>\u26a0 Risk Warnings</strong><br>';
+    if (agentFlags.length > 0) {
+      warnHtml += agentFlags.map(function (f) { return '\u2022 ' + escapeHtml(f); }).join('<br>');
+      if (warnings.length > 0) warnHtml += '<br>';
+    }
+    warnings.forEach(function (w) {
+      warnHtml += '\u2022 <strong>' + escapeHtml(w.title) + ':</strong> ' + escapeHtml(w.text) + '<br>';
+    });
+    warnHtml += '</div>';
+    html += '<div style="grid-column:1/-1">' + warnHtml + '</div>';
+  }
+
+  $dpAgentGrid.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Fetch Gainers (REST)
+// ---------------------------------------------------------------------------
+async function fetchGainers() {
+  try {
+    var res = await fetch(API + "/api/gainers");
+    var data = await res.json();
+    if (data.candidates && data.candidates.length > 0) {
+      state.gainers = data.candidates;
+      state.gainersDate = data.analysis_date || null;
+      state.gainersUpdated = data.last_updated || null;
+      renderGainersCards();
+    }
+  } catch (e) {
+    console.warn("Gainers fetch failed:", e);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 (function init() {
   renderSkeletonCards();
   fetchData();
+  fetchGainers();
   connectWebSocket();
   // Fallback polling in case WS never connects
   pollTimer = setInterval(fetchData, 15000);

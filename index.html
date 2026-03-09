@@ -97,35 +97,59 @@
   <!-- =================== MAIN CONTENT =================== -->
   <main class="main-content">
 
-    <!-- Section Header -->
-    <div class="section-header">
-      <div>
-        <div class="title">Top Gainers - Short Candidates</div>
-        <div class="subtitle">Ranked by short opportunity score</div>
+    <!-- Tab Bar -->
+    <div class="tab-bar" id="tab-bar">
+      <button class="tab active" data-tab="watchlist">Watchlist</button>
+      <button class="tab" data-tab="gainers">Short Gainers <span class="tab-badge" id="gainers-badge"></span></button>
+    </div>
+
+    <!-- ====== WATCHLIST TAB ====== -->
+    <div class="tab-content active" id="tab-watchlist">
+      <div class="section-header">
+        <div>
+          <div class="title">Top Gainers - Short Candidates</div>
+          <div class="subtitle">Ranked by short opportunity score</div>
+        </div>
+        <div class="add-symbol-box" id="add-symbol-box">
+          <input type="text" id="add-symbol-input" class="add-symbol-input" placeholder="Add symbol..." maxlength="6" autocomplete="off" spellcheck="false">
+          <button id="add-symbol-btn" class="add-symbol-btn" title="Add symbol to scanner">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          </button>
+          <span id="add-symbol-status" class="add-symbol-status"></span>
+        </div>
+        <div class="legend">
+          <div class="legend-item">
+            <span class="legend-dot high"></span> High Risk (80+)
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot moderate"></span> Moderate (60-79)
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot low"></span> Low (&lt;60)
+          </div>
+        </div>
       </div>
-      <div class="add-symbol-box" id="add-symbol-box">
-        <input type="text" id="add-symbol-input" class="add-symbol-input" placeholder="Add symbol..." maxlength="6" autocomplete="off" spellcheck="false">
-        <button id="add-symbol-btn" class="add-symbol-btn" title="Add symbol to scanner">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-        </button>
-        <span id="add-symbol-status" class="add-symbol-status"></span>
-      </div>
-      <div class="legend">
-        <div class="legend-item">
-          <span class="legend-dot high"></span> High Risk (80+)
-        </div>
-        <div class="legend-item">
-          <span class="legend-dot moderate"></span> Moderate (60-79)
-        </div>
-        <div class="legend-item">
-          <span class="legend-dot low"></span> Low (&lt;60)
-        </div>
+      <div class="card-grid" id="card-grid">
+        <!-- Populated by JS -->
       </div>
     </div>
 
-    <!-- Card Grid -->
-    <div class="card-grid" id="card-grid">
-      <!-- Populated by JS (skeleton loaders initially) -->
+    <!-- ====== SHORT GAINERS TAB ====== -->
+    <div class="tab-content" id="tab-gainers">
+      <div class="section-header">
+        <div>
+          <div class="title">Short Gainers Agent</div>
+          <div class="subtitle" id="gainers-subtitle">Loading agent data...</div>
+        </div>
+        <div class="legend">
+          <div class="legend-item"><span class="legend-dot" style="background:#22c55e"></span> Score 7+ (Strong)</div>
+          <div class="legend-item"><span class="legend-dot" style="background:#fbbf24"></span> Score 5-7 (Moderate)</div>
+          <div class="legend-item"><span class="legend-dot" style="background:#ef4444"></span> Score &lt;5 (Avoid)</div>
+        </div>
+      </div>
+      <div class="card-grid" id="gainers-grid">
+        <!-- Populated by JS -->
+      </div>
     </div>
 
     <!-- Footer -->
@@ -212,6 +236,17 @@
         <div class="dp-section">
           <h3 class="dp-section-title">Fundamentals</h3>
           <div class="dp-fund-grid" id="dp-fund-grid">
+            <!-- Populated by JS -->
+          </div>
+        </div>
+
+        <!-- Agent Analysis (Short Gainers Agent) -->
+        <div class="dp-section dp-agent-section" id="dp-agent-section" style="display:none;">
+          <h3 class="dp-section-title" style="color:#f97316;">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="dp-icon"><path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/></svg>
+            Agent Analysis
+          </h3>
+          <div class="dp-agent-grid" id="dp-agent-grid">
             <!-- Populated by JS -->
           </div>
         </div>

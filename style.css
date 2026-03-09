@@ -1391,4 +1391,185 @@ html, body {
   .dp-price { font-size: 24px; }
   .dp-bidask { flex-direction: column; gap: 6px; }
   .dp-fund-grid { grid-template-columns: 1fr; }
+  .tab-bar { gap: 4px; }
+  .tab { font-size: 12px; padding: 8px 12px; }
 }
+
+/* ====== Tab Bar ====== */
+.tab-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 4px;
+  background: rgba(255,255,255,0.03);
+  border-radius: 10px;
+  width: fit-content;
+}
+.tab {
+  background: transparent;
+  border: none;
+  color: #64748b;
+  font-family: 'Inter', sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 20px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+}
+.tab:hover { color: #94a3b8; background: rgba(255,255,255,0.04); }
+.tab.active {
+  color: #e2e8f0;
+  background: rgba(255,255,255,0.08);
+}
+.tab-badge {
+  display: inline-block;
+  background: #f97316;
+  color: #000;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 8px;
+  margin-left: 4px;
+  min-width: 18px;
+  text-align: center;
+}
+.tab-badge:empty { display: none; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+/* ====== Gainers Cards ====== */
+.gainer-card {
+  background: linear-gradient(135deg, rgba(15,23,42,0.95), rgba(30,41,59,0.9));
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+  padding: 16px;
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+  overflow: hidden;
+}
+.gainer-card:hover {
+  border-color: rgba(249,115,22,0.3);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+}
+.gainer-card .gc-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+.gainer-card .gc-symbol {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 16px;
+  font-weight: 700;
+  color: #e2e8f0;
+}
+.gainer-card .gc-expression {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+.gc-expression.short-shares { background: rgba(239,68,68,0.2); color: #ef4444; }
+.gc-expression.buy-puts { background: rgba(249,115,22,0.2); color: #f97316; }
+.gc-expression.put-spreads { background: rgba(251,191,36,0.2); color: #fbbf24; }
+.gc-expression.avoid { background: rgba(100,116,139,0.2); color: #64748b; }
+.gainer-card .gc-company {
+  font-size: 11px;
+  color: #64748b;
+  margin-bottom: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gainer-card .gc-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.gainer-card .gc-metric {
+  display: flex;
+  flex-direction: column;
+}
+.gainer-card .gc-metric-label {
+  font-size: 9px;
+  color: #475569;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.gainer-card .gc-metric-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  font-weight: 600;
+  color: #cbd5e1;
+}
+.gainer-card .gc-score-bar {
+  height: 3px;
+  background: rgba(255,255,255,0.06);
+  border-radius: 2px;
+  margin-top: 10px;
+  overflow: hidden;
+}
+.gainer-card .gc-score-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.4s;
+}
+.gc-score-fill.high { background: #22c55e; }
+.gc-score-fill.moderate { background: #fbbf24; }
+.gc-score-fill.low { background: #ef4444; }
+.gainer-card .gc-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+.gc-flag {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(239,68,68,0.15);
+  color: #fca5a5;
+  font-weight: 500;
+}
+
+/* ====== Agent Detail Section ====== */
+.dp-agent-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.dp-agent-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  font-size: 12px;
+}
+.dp-agent-item .agent-label { color: #64748b; }
+.dp-agent-item .agent-value { color: #cbd5e1; font-weight: 600; font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+.dp-agent-item .agent-value.danger { color: #ef4444; }
+.dp-agent-item .agent-value.warning { color: #fbbf24; }
+.dp-agent-item .agent-value.success { color: #22c55e; }
+.dp-agent-expression {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+.dp-agent-warnings {
+  margin-top: 10px;
+  padding: 10px;
+  background: rgba(239,68,68,0.08);
+  border: 1px solid rgba(239,68,68,0.2);
+  border-radius: 8px;
+  font-size: 11px;
+  color: #fca5a5;
+}
+.dp-agent-warnings strong { color: #ef4444; }
