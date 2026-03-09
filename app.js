@@ -794,12 +794,28 @@ function renderNewsFeed(articles) {
 }
 
 // ---------------------------------------------------------------------------
-// Databento Tick Chart — 3 lines: bid (blue), ask (red), last (green)
+// Databento Tick Chart — 3 smoothed lines: bid (blue), ask (orange), last (green)
+// Uses EMA (exponential moving average) to filter tick noise while preserving
+// real price moves. Spread zone shaded between smoothed bid/ask.
 // ---------------------------------------------------------------------------
+
+// EMA smoother — alpha controls responsiveness (lower = smoother)
+function emaSeries(raw, alpha) {
+  var out = new Array(raw.length);
+  var prev = 0;
+  for (var i = 0; i < raw.length; i++) {
+    if (raw[i] <= 0) { out[i] = prev; continue; }
+    if (prev === 0) { prev = raw[i]; out[i] = raw[i]; continue; }
+    prev = alpha * raw[i] + (1 - alpha) * prev;
+    out[i] = prev;
+  }
+  return out;
+}
+
 function renderTickChart(ticks) {
-  const canvas = document.getElementById("dp-chart");
-  const ctx = canvas.getContext("2d");
-  const rect = canvas.parentElement.getBoundingClientRect();
+  var canvas = document.getElementById("dp-chart");
+  var ctx = canvas.getContext("2d");
+  var rect = canvas.parentElement.getBoundingClientRect();
   canvas.width = rect.width - 24;
   canvas.height = rect.height - 24;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -812,34 +828,36 @@ function renderTickChart(ticks) {
     return;
   }
 
-  var bids = ticks.map(function (t) { return t.bid; });
-  var asks = ticks.map(function (t) { return t.ask; });
-  var lasts = ticks.map(function (t) { return t.last; });
-  var allPrices = bids.concat(asks, lasts).filter(function (p) { return p > 0; });
+  // Smoothing factor — adaptive to tick count
+  // More ticks = heavier smoothing so the chart stays clean
+  var alpha = ticks.length > 200 ? 0.06 : ticks.length > 80 ? 0.10 : 0.18;
 
+  var rawBids = ticks.map(function (t) { return t.bid; });
+  var rawAsks = ticks.map(function (t) { return t.ask; });
+  var rawLasts = ticks.map(function (t) { return t.last; });
+
+  var bids = emaSeries(rawBids, alpha);
+  var asks = emaSeries(rawAsks, alpha);
+  var lasts = emaSeries(rawLasts, alpha);
+
+  var allPrices = bids.concat(asks, lasts).filter(function (p) { return p > 0; });
   var minP = Math.min.apply(null, allPrices);
   var maxP = Math.max.apply(null, allPrices);
   var range = maxP - minP;
-  if (range < 0.01) { range = 0.01; } // prevent flat chart
+  if (range < 0.01) { range = 0.01; }
 
   var w = canvas.width;
   var h = canvas.height;
   var padTop = 14;
   var padBottom = 24;
   var padLeft = 55;
-  var padRight = 10;
+  var padRight = 50;  // room for current price labels at right edge
   var plotW = w - padLeft - padRight;
   var plotH = h - padTop - padBottom;
   var n = ticks.length;
 
-  // Map price to Y
-  function yOf(price) {
-    return padTop + (1 - (price - minP) / range) * plotH;
-  }
-  // Map index to X
-  function xOf(i) {
-    return padLeft + (i / (n - 1)) * plotW;
-  }
+  function yOf(price) { return padTop + (1 - (price - minP) / range) * plotH; }
+  function xOf(i) { return padLeft + (i / (n - 1)) * plotW; }
 
   // Y-axis labels + grid
   ctx.fillStyle = "#64748b";
@@ -856,7 +874,7 @@ function renderTickChart(ticks) {
     ctx.stroke();
   }
 
-  // Draw a line series
+  // Draw a smoothed line series
   function drawLine(series, color, lineW) {
     ctx.beginPath();
     var started = false;
@@ -872,26 +890,44 @@ function renderTickChart(ticks) {
     ctx.stroke();
   }
 
-  // Bid/Ask spread fill (shaded area between bid and ask)
+  // Spread fill (shaded area between smoothed bid and ask)
   ctx.beginPath();
+  var spreadStarted = false;
   for (var i = 0; i < n; i++) {
     if (asks[i] <= 0 || bids[i] <= 0) continue;
-    var px = xOf(i);
-    if (i === 0) ctx.moveTo(px, yOf(asks[i]));
-    else ctx.lineTo(px, yOf(asks[i]));
+    if (!spreadStarted) { ctx.moveTo(xOf(i), yOf(asks[i])); spreadStarted = true; }
+    else { ctx.lineTo(xOf(i), yOf(asks[i])); }
   }
   for (var i = n - 1; i >= 0; i--) {
     if (asks[i] <= 0 || bids[i] <= 0) continue;
     ctx.lineTo(xOf(i), yOf(bids[i]));
   }
   ctx.closePath();
-  ctx.fillStyle = "rgba(100,116,139,0.12)";
+  ctx.fillStyle = "rgba(100,116,139,0.10)";
   ctx.fill();
 
-  // Draw lines: bid (blue), ask (red/orange), last (green)
-  drawLine(bids, "#60a5fa", 1.5);  // blue
-  drawLine(asks, "#f97316", 1.5);  // orange
-  drawLine(lasts, "#34d399", 2);   // green (prominent)
+  // Draw smoothed lines: bid (blue), ask (orange), last (green)
+  drawLine(bids, "#60a5fa", 1.5);
+  drawLine(asks, "#f97316", 1.5);
+  drawLine(lasts, "#34d399", 2.5);
+
+  // Current price label at right edge
+  var lastBid = bids[n - 1], lastAsk = asks[n - 1], lastLast = lasts[n - 1];
+  ctx.font = "9px JetBrains Mono, monospace";
+  ctx.textAlign = "left";
+  var labelX = xOf(n - 1) + 4;
+  if (lastBid > 0) {
+    ctx.fillStyle = "#60a5fa";
+    ctx.fillText(lastBid.toFixed(2), labelX, yOf(lastBid) + 3);
+  }
+  if (lastAsk > 0) {
+    ctx.fillStyle = "#f97316";
+    ctx.fillText(lastAsk.toFixed(2), labelX, yOf(lastAsk) + 3);
+  }
+  if (lastLast > 0) {
+    ctx.fillStyle = "#34d399";
+    ctx.fillText(lastLast.toFixed(2), labelX, yOf(lastLast) + 3);
+  }
 
   // X-axis time labels
   ctx.fillStyle = "#64748b";
