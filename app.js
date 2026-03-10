@@ -1124,7 +1124,11 @@ function renderGainersCards() {
   }
 
   if (cands.length === 0) {
-    $gainersGrid.innerHTML = '<div class="dp-loading" style="grid-column:1/-1;padding:40px">No Short Gainers Agent data available yet. The agent refreshes every 15 minutes.</div>';
+    var emptyMsg = 'No candidates from Short Gainers Agent.';
+    if (state.gainersDate) emptyMsg += ' Last analysis: ' + state.gainersDate;
+    if (state.gainersUpdated) emptyMsg += ' (' + state.gainersUpdated + ')';
+    emptyMsg += ' Refreshes every 5 minutes.';
+    $gainersGrid.innerHTML = '<div class="dp-loading" style="grid-column:1/-1;padding:40px">' + emptyMsg + '</div>';
     return;
   }
 
@@ -1263,12 +1267,11 @@ async function fetchGainers() {
   try {
     var res = await fetch(API + "/api/gainers");
     var data = await res.json();
-    if (data.candidates && data.candidates.length > 0) {
-      state.gainers = data.candidates;
-      state.gainersDate = data.analysis_date || null;
-      state.gainersUpdated = data.last_updated || null;
-      renderGainersCards();
-    }
+    // Always update state and render (even if empty, to clear "Loading..." message)
+    state.gainers = (data.candidates && data.candidates.length > 0) ? data.candidates : [];
+    state.gainersDate = data.analysis_date || null;
+    state.gainersUpdated = data.last_updated || null;
+    renderGainersCards();
   } catch (e) {
     console.warn("Gainers fetch failed:", e);
   }

@@ -1113,57 +1113,85 @@ def _build_fallback_candidate(sym: str) -> ShortCandidate:
 GAINERS_URL = os.getenv("GAINERS_URL", "https://kaos-short.netlify.app")
 _gainers_cache: dict = {"candidates": [], "last_updated": None, "analysis_date": None}
 _gainers_detail_cache: dict[str, dict] = {}  # symbol -> parsed detail data
+_gainers_raw_html: str = ""  # cache raw HTML for diagnostics
 
 import re as _re
+from bs4 import BeautifulSoup as _BS
+
 
 def _parse_gainers_index(html: str) -> list[dict]:
-    """Parse the Short Gainers Agent index.html table into structured data."""
+    """Parse the Short Gainers Agent index.html table using BeautifulSoup.
+
+    This is a robust parser that doesn't rely on exact HTML attribute patterns.
+    It finds every clickable <tr> row and extracts cells by position:
+      0: rank, 1: ticker(strong), 2: company, 3: score, 4: expression,
+      5: change%, 6: price, 7: RSI, 8: flags
+    """
     candidates = []
-    # Extract analysis date
+
+    # Extract analysis date and last updated via regex (simple, reliable)
     date_match = _re.search(r'Analysis Date:\s*([\d-]+)', html)
     analysis_date = date_match.group(1) if date_match else None
-    # Extract last updated
     updated_match = _re.search(r'Last Updated:\s*([\d:]+\s*[AP]M\s*ET)', html)
     last_updated = updated_match.group(1).strip() if updated_match else None
 
-    # Parse table rows: each <tr onclick="window.location='TICKER.html'"> ...
-    row_pattern = _re.compile(
-        r"<tr[^>]*onclick=\"window\.location='([^']+)\.html'\"[^>]*>\s*"
-        r"<td>\d+</td>\s*"
-        r"<td><strong>([^<]+)</strong></td>\s*"  # ticker
-        r"<td>([^<]*)</td>\s*"  # company
-        r'<td[^>]*>([\d.]+)</td>\s*'  # score
-        r'<td[^>]*>([^<]+)</td>\s*'  # expression
-        r'<td[^>]*>([^<]+)</td>\s*'  # change
-        r"<td[^>]*>([^<]*)</td>\s*"  # price (may have data-field attr)
-        r"<td[^>]*>([^<]*)</td>\s*"  # rsi (may have attrs)
-        r"<td>(.*?)</td>",  # flags (may contain spans)
-        _re.DOTALL
-    )
-    for m in row_pattern.finditer(html):
-        flags_html = m.group(9)
-        flags = _re.findall(r'class="flag-mini">([^<]+)<', flags_html)
+    soup = _BS(html, "html.parser")
+    # Find all table rows that have an onclick linking to a TICKER.html page
+    for tr in soup.find_all("tr", onclick=True):
+        onclick = tr.get("onclick", "")
+        ticker_match = _re.search(r"'([A-Za-z^.]+)\.html'", onclick)
+        if not ticker_match:
+            continue
+        cells = tr.find_all("td")
+        if len(cells) < 8:
+            continue  # skip malformed rows
+
+        # Cell extraction by position
+        ticker_el = cells[1].find("strong")
+        ticker = ticker_el.get_text(strip=True) if ticker_el else cells[1].get_text(strip=True)
+        company = cells[2].get_text(strip=True)
+
+        # Score
         try:
-            change_str = m.group(6).strip().replace('%', '').replace('+', '')
+            score = float(cells[3].get_text(strip=True))
+        except (ValueError, TypeError):
+            score = 0.0
+
+        expression = cells[4].get_text(strip=True)
+
+        # Change %
+        try:
+            change_str = cells[5].get_text(strip=True).replace("%", "").replace("+", "")
             change_pct = float(change_str)
         except (ValueError, TypeError):
             change_pct = 0.0
+
+        # Price
         try:
-            price = float(m.group(7).strip().replace('$', '').replace(',', ''))
+            price = float(cells[6].get_text(strip=True).replace("$", "").replace(",", ""))
         except (ValueError, TypeError):
             price = 0.0
-        try:
-            score = float(m.group(4).strip())
-        except (ValueError, TypeError):
-            score = 0.0
-        rsi_str = m.group(8).strip()
-        rsi = float(rsi_str) if rsi_str and rsi_str != 'N/A' else None
+
+        # RSI
+        rsi_str = cells[7].get_text(strip=True) if len(cells) > 7 else ""
+        rsi = None
+        if rsi_str and rsi_str != "N/A":
+            try:
+                rsi = float(rsi_str)
+            except (ValueError, TypeError):
+                pass
+
+        # Flags (may contain <span class="flag-mini">...</span>)
+        flags = []
+        if len(cells) > 8:
+            for span in cells[8].find_all("span", class_=lambda c: c and "flag" in c):
+                flags.append(span.get_text(strip=True))
 
         candidates.append({
-            "symbol": m.group(2).strip(),
-            "company": m.group(3).strip(),
+            "symbol": ticker,
+            "company": company,
             "score": score,
-            "expression": m.group(5).strip(),
+            "expression": expression,
             "change_pct": change_pct,
             "price": price,
             "rsi": rsi,
@@ -1259,14 +1287,16 @@ def _parse_gainers_detail(html: str) -> dict:
 
 async def fetch_gainers_from_agent():
     """Fetch the Short Gainers Agent output from Netlify and parse it."""
-    global _gainers_cache, _gainers_detail_cache
+    global _gainers_cache, _gainers_detail_cache, _gainers_raw_html
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             # Fetch index page
             r = await client.get(f"{GAINERS_URL}/index.html")
             if r.status_code != 200:
                 print(f"[Gainers] Index fetch failed: {r.status_code}", flush=True)
                 return
+            _gainers_raw_html = r.text  # cache for diagnostics
+            print(f"[Gainers] Fetched {len(r.text)} chars from {GAINERS_URL}, encoding={r.encoding}", flush=True)
             candidates, analysis_date, last_updated = _parse_gainers_index(r.text)
             _gainers_cache = {
                 "candidates": candidates,
@@ -1676,6 +1706,39 @@ async def get_scanner():
 async def get_gainers():
     """Return Short Gainers Agent candidates (from kaos-short.netlify.app)."""
     return _gainers_cache
+
+
+@app.post("/api/gainers/refresh")
+async def refresh_gainers():
+    """Manually trigger a gainers fetch + parse cycle."""
+    await fetch_gainers_from_agent()
+    return {
+        "status": "refreshed",
+        "candidates": len(_gainers_cache.get("candidates", [])),
+        "fetched_at": _gainers_cache.get("fetched_at"),
+        "analysis_date": _gainers_cache.get("analysis_date"),
+        "last_updated": _gainers_cache.get("last_updated"),
+    }
+
+
+@app.get("/api/gainers/diag")
+async def gainers_diagnostic():
+    """Diagnostic endpoint: shows raw HTML length, first 2000 chars, parse result count."""
+    html = _gainers_raw_html
+    # Re-parse to show live result
+    if html:
+        candidates, analysis_date, last_updated = _parse_gainers_index(html)
+    else:
+        candidates, analysis_date, last_updated = [], None, None
+    return {
+        "gainers_url": GAINERS_URL,
+        "raw_html_length": len(html),
+        "raw_html_preview": html[:2000] if html else "(empty — not yet fetched)",
+        "parse_result_count": len(candidates),
+        "parse_result_symbols": [c["symbol"] for c in candidates],
+        "cache_candidates": len(_gainers_cache.get("candidates", [])),
+        "cache_fetched_at": _gainers_cache.get("fetched_at"),
+    }
 
 
 @app.get("/api/gainers/{symbol}")
