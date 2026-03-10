@@ -1135,8 +1135,8 @@ def _parse_gainers_index(html: str) -> list[dict]:
         r'<td[^>]*>([\d.]+)</td>\s*'  # score
         r'<td[^>]*>([^<]+)</td>\s*'  # expression
         r'<td[^>]*>([^<]+)</td>\s*'  # change
-        r"<td>([^<]*)</td>\s*"  # price
-        r"<td>([^<]*)</td>\s*"  # rsi
+        r"<td[^>]*>([^<]*)</td>\s*"  # price (may have data-field attr)
+        r"<td[^>]*>([^<]*)</td>\s*"  # rsi (may have attrs)
         r"<td>(.*?)</td>",  # flags (may contain spans)
         _re.DOTALL
     )
@@ -1275,6 +1275,18 @@ async def fetch_gainers_from_agent():
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
             }
             print(f"[Gainers] Parsed {len(candidates)} candidates from agent (date={analysis_date}, updated={last_updated})", flush=True)
+
+            # Auto-add gainers symbols to the watchlist so they appear in the scanner
+            if candidates:
+                added = []
+                for c in candidates:
+                    sym = c["symbol"]
+                    if sym not in store.watchlist:
+                        store.watchlist.append(sym)
+                        added.append(sym)
+                if added:
+                    store.persist_watchlist()
+                    print(f"[Gainers] Auto-added {len(added)} symbols to watchlist: {added}", flush=True)
 
             # Fetch detail pages for top candidates (score > 0)
             for c in candidates:
