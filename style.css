@@ -20,6 +20,7 @@
   --text-secondary: #94a3b8;
   --text-muted: #64748b;
   --text-dim: #475569;
+  --text-tertiary: #475569;
 
   --green: #22c55e;
   --green-dim: rgba(34,197,94,0.15);
@@ -1217,13 +1218,45 @@ html, body {
   color: var(--text-secondary);
 }
 
+/* Chart Header & Timeframe Tabs */
+.dp-chart-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.dp-chart-header .dp-section-title { margin-bottom: 0; }
+.dp-tf-tabs {
+  display: flex;
+  gap: 2px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 6px;
+  padding: 2px;
+}
+.dp-tf {
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+  letter-spacing: 0.5px;
+}
+.dp-tf:hover { color: var(--text-secondary); background: rgba(255,255,255,0.06); }
+.dp-tf.active { color: #60a5fa; background: rgba(96,165,250,0.12); }
+.dp-tf.loading { opacity: 0.5; pointer-events: none; }
+
 /* Chart */
 .dp-chart-container {
   background: var(--bg-card);
   border: 1px solid var(--border-card);
   border-radius: 10px;
   padding: 12px;
-  height: 180px;
+  height: 200px;
 }
 #dp-chart { width: 100%; height: 100%; }
 

@@ -605,14 +605,22 @@ const $detailBackdrop = document.getElementById("detail-backdrop");
 const $detailClose = document.getElementById("dp-close");
 let detailSymbol = null;
 let detailTickTimer = null;
+let detailTimeframe = "live";  // current chart timeframe: live, 1d, 1w, 1m, 3m, 1y
+let detailCandleCache = {};   // cache: {"AAPL:1w": {candles:[], ts:...}}
 
 function openDetailPanel(symbol) {
   detailSymbol = symbol;
+  detailTimeframe = "live";  // always start on Live
   $detailOverlay.classList.remove("hidden");
   // Force reflow for animation
   void $detailOverlay.offsetHeight;
   $detailOverlay.classList.add("visible");
   document.body.style.overflow = "hidden";
+
+  // Reset timeframe tabs
+  document.querySelectorAll(".dp-tf").forEach(function (b) {
+    b.classList.toggle("active", b.dataset.tf === "live");
+  });
 
   // Show loading state
   document.getElementById("dp-symbol").textContent = symbol;
@@ -630,10 +638,10 @@ function openDetailPanel(symbol) {
       document.getElementById("dp-news-feed").innerHTML = '<div class="dp-loading">Error loading data</div>';
     });
 
-  // Auto-refresh tick chart every 3s while panel is open
+  // Auto-refresh tick chart every 3s while panel is open (only when on Live tab)
   if (detailTickTimer) clearInterval(detailTickTimer);
   detailTickTimer = setInterval(function () {
-    if (!detailSymbol) return;
+    if (!detailSymbol || detailTimeframe !== "live") return;
     fetch(`${API}/api/ticks/${detailSymbol}`)
       .then(function (r) { return r.json(); })
       .then(function (data) {
@@ -688,6 +696,10 @@ function renderDetailPanel(data) {
   // Header
   document.getElementById("dp-symbol").textContent = data.symbol;
   document.getElementById("dp-company").textContent = data.company_name || data.symbol;
+  // Cache company name for future use (dynamic symbols not in hardcoded map)
+  if (data.company_name && data.company_name !== data.symbol) {
+    COMPANY_NAMES[data.symbol] = data.company_name;
+  }
 
   const chgEl = document.getElementById("dp-change");
   const pct = data.change_pct || 0;
@@ -733,11 +745,37 @@ function renderDetailPanel(data) {
   // Agent Analysis (Short Gainers Agent data merged into detail response)
   renderAgentDetail(data.agent || null);
 
-  // Chart — prefer Databento ticks (bid/ask/last), fall back to AV candles
-  if (data.ticks && data.ticks.length >= 2) {
-    renderTickChart(data.ticks);
+  // Chart — show based on current timeframe
+  // Cache AV candles from the detail response for the "1d" tab
+  if (data.candles && data.candles.length > 0) {
+    detailCandleCache[data.symbol + ":1d"] = { candles: data.candles, ts: Date.now() };
+  }
+  // Determine Live tab availability
+  var hasLiveTicks = data.ticks && data.ticks.length >= 2;
+  var liveBtn = document.querySelector('.dp-tf[data-tf="live"]');
+  if (liveBtn) {
+    if (hasLiveTicks) {
+      liveBtn.textContent = "Live";
+      liveBtn.style.opacity = "";
+    } else {
+      liveBtn.textContent = "Live";
+      liveBtn.style.opacity = "0.4";
+    }
+  }
+  // If on Live and we have ticks, show tick chart; otherwise show 1D or whichever is active
+  if (detailTimeframe === "live") {
+    if (hasLiveTicks) {
+      renderTickChart(data.ticks);
+    } else {
+      // Auto-fallback to 1D view
+      detailTimeframe = "1d";
+      document.querySelectorAll(".dp-tf").forEach(function (b) {
+        b.classList.toggle("active", b.dataset.tf === "1d");
+      });
+      renderPriceChart(data.candles || []);
+    }
   } else {
-    renderPriceChart(data.candles || []);
+    loadTimeframeChart(data.symbol, detailTimeframe);
   }
 }
 
@@ -821,6 +859,76 @@ function renderNewsFeed(articles) {
   }).join("");
 
   document.getElementById("dp-news-feed").innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Timeframe Tab Switching
+// ---------------------------------------------------------------------------
+document.getElementById("dp-tf-tabs").addEventListener("click", function (e) {
+  var btn = e.target.closest(".dp-tf");
+  if (!btn || !btn.dataset.tf || !detailSymbol) return;
+  var tf = btn.dataset.tf;
+  if (tf === detailTimeframe) return;
+  detailTimeframe = tf;
+  // Update active state
+  document.querySelectorAll(".dp-tf").forEach(function (b) {
+    b.classList.toggle("active", b.dataset.tf === tf);
+  });
+  // Render the right chart
+  if (tf === "live") {
+    // Fetch fresh ticks
+    fetch(`${API}/api/ticks/${detailSymbol}`)
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.ticks && data.ticks.length >= 2) {
+          renderTickChart(data.ticks);
+        } else {
+          renderChartMessage("No live Databento ticks for this symbol");
+        }
+      })
+      .catch(function () { renderChartMessage("Error loading live data"); });
+  } else {
+    loadTimeframeChart(detailSymbol, tf);
+  }
+});
+
+function loadTimeframeChart(symbol, period) {
+  var cacheKey = symbol + ":" + period;
+  // Use cache if fresh (< 60s)
+  var cached = detailCandleCache[cacheKey];
+  if (cached && (Date.now() - cached.ts) < 60000) {
+    renderPriceChart(cached.candles, period);
+    return;
+  }
+  // Show loading
+  renderChartMessage("Loading " + period.toUpperCase() + " data...");
+  fetch(`${API}/api/candles/${symbol}?period=${period}`)
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      var candles = data.candles || [];
+      detailCandleCache[cacheKey] = { candles: candles, ts: Date.now() };
+      if (detailSymbol === symbol && detailTimeframe === period) {
+        renderPriceChart(candles, period);
+      }
+    })
+    .catch(function () {
+      if (detailSymbol === symbol && detailTimeframe === period) {
+        renderChartMessage("Error loading " + period.toUpperCase() + " data");
+      }
+    });
+}
+
+function renderChartMessage(msg) {
+  var canvas = document.getElementById("dp-chart");
+  var ctx = canvas.getContext("2d");
+  var rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width - 24;
+  canvas.height = rect.height - 24;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#64748b";
+  ctx.font = "13px Inter, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(msg, canvas.width / 2, canvas.height / 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -998,12 +1106,12 @@ function renderTickChart(ticks) {
 }
 
 // ---------------------------------------------------------------------------
-// AV Candle Chart (fallback when no Databento ticks)
+// AV Candle Chart — used for 1D, 1W, 1M, 3M, 1Y timeframes
 // ---------------------------------------------------------------------------
-function renderPriceChart(candles) {
-  const canvas = document.getElementById("dp-chart");
-  const ctx = canvas.getContext("2d");
-  const rect = canvas.parentElement.getBoundingClientRect();
+function renderPriceChart(candles, period) {
+  var canvas = document.getElementById("dp-chart");
+  var ctx = canvas.getContext("2d");
+  var rect = canvas.parentElement.getBoundingClientRect();
   canvas.width = rect.width - 24;
   canvas.height = rect.height - 24;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -1012,23 +1120,40 @@ function renderPriceChart(candles) {
     ctx.fillStyle = "#64748b";
     ctx.font = "13px Inter, sans-serif";
     ctx.textAlign = "center";
-    ctx.fillText("No intraday data available", canvas.width / 2, canvas.height / 2);
+    ctx.fillText("No data available for this timeframe", canvas.width / 2, canvas.height / 2);
     return;
   }
 
-  const prices = candles.map(function (c) { return c.close; });
-  const minP = Math.min.apply(null, prices);
-  const maxP = Math.max.apply(null, prices);
-  const range = maxP - minP || 1;
-  const w = canvas.width;
-  const h = canvas.height;
-  const padTop = 10;
-  const padBottom = 20;
-  const padLeft = 50;
-  const plotW = w - padLeft - 10;
-  const plotH = h - padTop - padBottom;
+  period = period || "1d";
+  var isIntraday = (period === "1d");
 
-  // Draw Y-axis labels
+  var prices = candles.map(function (c) { return c.close; });
+  var highs = candles.map(function (c) { return c.high; });
+  var lows = candles.map(function (c) { return c.low; });
+  var allP = prices.concat(highs, lows).filter(function (p) { return p > 0; });
+  var minP = Math.min.apply(null, allP);
+  var maxP = Math.max.apply(null, allP);
+  var range = maxP - minP;
+  if (range < 0.01) range = Math.max(0.01, maxP * 0.01);
+  // Add 5% padding
+  minP -= range * 0.05;
+  maxP += range * 0.05;
+  range = maxP - minP;
+
+  var w = canvas.width;
+  var h = canvas.height;
+  var padTop = 14;
+  var padBottom = 24;
+  var padLeft = 55;
+  var padRight = 50;
+  var plotW = w - padLeft - padRight;
+  var plotH = h - padTop - padBottom;
+  var n = candles.length;
+
+  function yOf(price) { return padTop + (1 - (price - minP) / range) * plotH; }
+  function xOf(i) { return padLeft + (i / Math.max(1, n - 1)) * plotW; }
+
+  // Y-axis labels + grid
   ctx.fillStyle = "#64748b";
   ctx.font = "10px JetBrains Mono, monospace";
   ctx.textAlign = "right";
@@ -1036,23 +1161,22 @@ function renderPriceChart(candles) {
     var yVal = minP + range * (1 - yi / 4);
     var yPos = padTop + plotH * (yi / 4);
     ctx.fillText("$" + yVal.toFixed(2), padLeft - 6, yPos + 3);
-    // Grid line
     ctx.strokeStyle = "rgba(255,255,255,0.04)";
     ctx.beginPath();
     ctx.moveTo(padLeft, yPos);
-    ctx.lineTo(w - 10, yPos);
+    ctx.lineTo(w - padRight, yPos);
     ctx.stroke();
   }
 
   // Price line
-  var isUp = prices[prices.length - 1] >= prices[0];
+  var isUp = prices[n - 1] >= prices[0];
   var lineColor = isUp ? "#34d399" : "#f87171";
 
   ctx.beginPath();
-  for (var i = 0; i < prices.length; i++) {
-    var x = padLeft + (i / (prices.length - 1)) * plotW;
-    var y = padTop + (1 - (prices[i] - minP) / range) * plotH;
-    if (i === 0) {ctx.moveTo(x, y);} else {ctx.lineTo(x, y);}
+  for (var i = 0; i < n; i++) {
+    var px = xOf(i);
+    var py = yOf(prices[i]);
+    if (i === 0) { ctx.moveTo(px, py); } else { ctx.lineTo(px, py); }
   }
   ctx.strokeStyle = lineColor;
   ctx.lineWidth = 2;
@@ -1060,30 +1184,75 @@ function renderPriceChart(candles) {
 
   // Gradient fill
   var grad = ctx.createLinearGradient(0, padTop, 0, h - padBottom);
-  grad.addColorStop(0, isUp ? "rgba(52,211,153,0.25)" : "rgba(248,113,113,0.25)");
+  grad.addColorStop(0, isUp ? "rgba(52,211,153,0.20)" : "rgba(248,113,113,0.20)");
   grad.addColorStop(1, "rgba(0,0,0,0)");
-
-  ctx.lineTo(padLeft + plotW, h - padBottom);
-  ctx.lineTo(padLeft, h - padBottom);
+  ctx.lineTo(xOf(n - 1), h - padBottom);
+  ctx.lineTo(xOf(0), h - padBottom);
   ctx.closePath();
   ctx.fillStyle = grad;
   ctx.fill();
 
-  // X-axis time labels
+  // Current price label at right edge
+  var lastPrice = prices[n - 1];
+  if (lastPrice > 0) {
+    var lpY = yOf(lastPrice);
+    ctx.fillStyle = lineColor;
+    ctx.font = "10px JetBrains Mono, monospace";
+    ctx.textAlign = "left";
+    ctx.fillText("$" + lastPrice.toFixed(2), xOf(n - 1) + 6, lpY + 3);
+    // Dashed line to right edge
+    ctx.setLineDash([3, 3]);
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(xOf(n - 1), lpY);
+    ctx.lineTo(w - padRight + 40, lpY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // X-axis labels — adaptive to period
   ctx.fillStyle = "#64748b";
   ctx.font = "10px Inter, sans-serif";
   ctx.textAlign = "center";
-  var step = Math.max(1, Math.floor(candles.length / 5));
-  for (var xi = 0; xi < candles.length; xi += step) {
-    var xp = padLeft + (xi / (candles.length - 1)) * plotW;
-    var timeStr2 = candles[xi].time || "";
-    // Parse ISO to short time
+  var labelCount = Math.min(n, isIntraday ? 6 : (period === "1w" ? n : 6));
+  var step = Math.max(1, Math.floor(n / labelCount));
+  for (var xi = 0; xi < n; xi += step) {
+    var xp = xOf(xi);
+    var rawTime = candles[xi].time || "";
+    var label = rawTime;
     try {
-      var dt = new Date(timeStr2);
-      timeStr2 = dt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+      if (isIntraday) {
+        // Show time: "10:30 AM"
+        var dt = new Date(rawTime);
+        label = dt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+      } else if (period === "1w" || period === "1m") {
+        // Show "Mar 5" or "3/5"
+        var parts = rawTime.split("-");
+        if (parts.length === 3) {
+          var months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+          label = months[parseInt(parts[1], 10) - 1] + " " + parseInt(parts[2], 10);
+        }
+      } else {
+        // 3M / 1Y: show "Mar" or "Mar '26"
+        var parts2 = rawTime.split("-");
+        if (parts2.length === 3) {
+          var months2 = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+          label = months2[parseInt(parts2[1], 10) - 1];
+          if (period === "1y") label += " '" + parts2[0].slice(2);
+        }
+      }
     } catch (e) { /* keep raw */ }
-    ctx.fillText(timeStr2, xp, h - 4);
+    ctx.fillText(label, xp, h - 4);
   }
+
+  // Period + change label
+  var changePct = ((prices[n - 1] - prices[0]) / prices[0] * 100).toFixed(2);
+  var periodLabel = { "1d": "Today", "1w": "1 Week", "1m": "1 Month", "3m": "3 Months", "1y": "1 Year" };
+  ctx.font = "10px Inter, sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillStyle = isUp ? "#34d399" : "#f87171";
+  ctx.fillText((periodLabel[period] || period) + "  " + (isUp ? "+" : "") + changePct + "%", padLeft + 4, padTop + 10);
 }
 
 // ---------------------------------------------------------------------------

@@ -213,7 +213,17 @@
 
         <!-- Price Chart -->
         <div class="dp-section">
-          <h3 class="dp-section-title">Intraday Price Action</h3>
+          <div class="dp-chart-header">
+            <h3 class="dp-section-title">Price Action</h3>
+            <div class="dp-tf-tabs" id="dp-tf-tabs">
+              <button class="dp-tf active" data-tf="live">Live</button>
+              <button class="dp-tf" data-tf="1d">1D</button>
+              <button class="dp-tf" data-tf="1w">1W</button>
+              <button class="dp-tf" data-tf="1m">1M</button>
+              <button class="dp-tf" data-tf="3m">3M</button>
+              <button class="dp-tf" data-tf="1y">1Y</button>
+            </div>
+          </div>
           <div class="dp-chart-container">
             <canvas id="dp-chart" width="400" height="160"></canvas>
           </div>

@@ -54,6 +54,30 @@ COMPANY_NAMES = {
     "AMD": "Advanced Micro Devices",
 }
 
+_company_name_cache: dict[str, str] = {}  # dynamic cache for names fetched from AV
+
+async def resolve_company_name(symbol: str) -> str:
+    """Return company name from hardcoded dict, cache, or AV OVERVIEW lookup."""
+    if symbol in COMPANY_NAMES:
+        return COMPANY_NAMES[symbol]
+    if symbol in _company_name_cache:
+        return _company_name_cache[symbol]
+    # Try Alpha Vantage OVERVIEW
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                "https://www.alphavantage.co/query",
+                params={"function": "OVERVIEW", "symbol": symbol, "apikey": ALPHA_VANTAGE_KEY}
+            )
+            info = r.json()
+            name = info.get("Name", symbol)
+            if name and name != "None":
+                _company_name_cache[symbol] = name
+                return name
+    except Exception:
+        pass
+    return symbol
+
 # ---------------------------------------------------------------------------
 # Data Models
 # ---------------------------------------------------------------------------
@@ -559,17 +583,20 @@ _databento_symbol_map: dict[int, str] = {}  # instrument_id -> symbol
 from collections import deque
 _TICK_HISTORY_MAX = 500  # ~8 min at 1 tick/sec
 _databento_tick_history: dict[str, deque] = {}  # symbol -> deque of tick dicts
+_databento_subscribed_symbols: set = set()  # track which symbols have live streams
 
 
 async def databento_start_live_stream(symbols: list[str]):
     """Start a Databento live streaming session using mbp-1 schema.
     MBP-1 provides best bid/offer (BBO) updates on every change.
     Runs in a daemon background thread since the Databento client is synchronous."""
-    global _databento_live_client, _databento_connected, _databento_last_update, _databento_error
+    global _databento_live_client, _databento_connected, _databento_last_update, _databento_error, _databento_subscribed_symbols
 
     if not DATABENTO_KEY:
         _databento_error = "No API key (set DATABENTO_KEY)"
         return
+
+    _databento_subscribed_symbols = set(s.upper() for s in symbols)
 
     import threading
 
@@ -706,6 +733,25 @@ async def databento_stop_live_stream():
                 pass
     _databento_connected = False
     _databento_live_client = None
+
+
+async def databento_ensure_subscribed(new_symbols: list[str]):
+    """Check if new symbols need Databento subscription. If so, restart the stream.
+    This is called when gainers auto-add symbols or when a user manually adds a symbol."""
+    global _databento_subscribed_symbols
+    if not DATABENTO_KEY:
+        return
+    new_set = set(s.upper() for s in new_symbols)
+    missing = new_set - _databento_subscribed_symbols
+    if not missing:
+        return  # all already subscribed
+    print(f"[Databento] New symbols need subscription: {missing}", flush=True)
+    all_syms = list(_databento_subscribed_symbols | new_set)
+    # Stop existing stream and restart with expanded symbol list
+    await databento_stop_live_stream()
+    await asyncio.sleep(1)  # brief pause before reconnecting
+    await databento_start_live_stream(all_syms)
+    print(f"[Databento] Restarted stream with {len(all_syms)} symbols", flush=True)
 
 
 async def fetch_databento_historical_quotes(symbols: list[str]) -> list[Quote]:
@@ -1317,6 +1363,11 @@ async def fetch_gainers_from_agent():
                 if added:
                     store.persist_watchlist()
                     print(f"[Gainers] Auto-added {len(added)} symbols to watchlist: {added}", flush=True)
+                    # Subscribe new symbols to Databento live stream
+                    try:
+                        await databento_ensure_subscribed(added)
+                    except Exception as e:
+                        print(f"[Gainers] Databento re-subscribe error: {e}", flush=True)
 
             # Fetch detail pages for top candidates (score > 0)
             for c in candidates:
@@ -1676,9 +1727,22 @@ async def get_technicals(symbol: str):
 
 
 @app.get("/api/candles/{symbol}")
-async def get_candles(symbol: str, period: str = "5d", interval: str = "5m"):
-    bars = await fetch_candles(symbol.upper(), period, interval)
-    return {"symbol": symbol.upper(), "candles": [b.model_dump() for b in bars]}
+async def get_candles(symbol: str, period: str = "1d"):
+    """Return OHLCV candles for a symbol at various timeframes."""
+    sym = symbol.upper()
+    if period == "1d":
+        bars = await fetch_alphavantage_intraday(sym, "5min")
+        candles = [{"time": b.timestamp, "open": b.open, "high": b.high, "low": b.low, "close": b.close, "volume": b.volume} for b in bars]
+    else:
+        count_map = {"1w": 5, "1m": 22, "3m": 66, "1y": 252}
+        count = count_map.get(period, 22)
+        outputsize = "full" if period == "1y" else "compact"
+        daily = await fetch_alphavantage_daily(sym, outputsize=outputsize)
+        # daily is newest-first, take last N then reverse so oldest first for charting
+        daily = daily[:count]
+        daily.reverse()
+        candles = [{"time": d["date"], "open": d["open"], "high": d["high"], "low": d["low"], "close": d["close"], "volume": d["volume"]} for d in daily]
+    return {"symbol": sym, "period": period, "candles": candles, "source": "alpha_vantage"}
 
 
 @app.get("/api/ticks/{symbol}")
@@ -1793,6 +1857,11 @@ async def add_to_watchlist(symbol: str = Query(...)):
     if sym not in store.watchlist:
         store.watchlist.append(sym)
         store.persist_watchlist()
+        # Subscribe to Databento live stream for the new symbol
+        try:
+            await databento_ensure_subscribed([sym])
+        except Exception:
+            pass
     # Trigger immediate rescan so the new symbol appears as a card
     try:
         candidates = await scan_short_candidates()
@@ -1974,6 +2043,10 @@ async def get_detail(symbol: str):
             )
             info = r.json()
             if info and "Symbol" in info:
+                # Cache company name from overview
+                _name = info.get("Name")
+                if _name and _name != "None" and sym not in COMPANY_NAMES:
+                    _company_name_cache[sym] = _name
                 def _safe_float(v):
                     try:
                         return float(v) if v and v != "None" else None
@@ -2001,9 +2074,14 @@ async def get_detail(symbol: str):
     except Exception:
         pass
 
+    # Resolve company name (use cached if available, else the AV OVERVIEW already fetched above)
+    resolved_name = COMPANY_NAMES.get(sym) or _company_name_cache.get(sym)
+    if not resolved_name:
+        resolved_name = await resolve_company_name(sym)
+
     return {
         "symbol": sym,
-        "company_name": COMPANY_NAMES.get(sym, sym),
+        "company_name": resolved_name,
         "price": live_quote.price if live_quote else (candidate.price if candidate else 0),
         "change_pct": live_quote.change_pct if live_quote else (candidate.change_pct if candidate else 0),
         "bid": db_data["bid"] if db_data else (live_quote.bid if live_quote else 0),
